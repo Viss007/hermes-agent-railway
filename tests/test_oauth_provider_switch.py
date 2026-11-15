@@ -32,29 +32,56 @@ def run_case(provider_hint: str | None, current_provider: str) -> dict:
         (home / "config.yaml").write_text(
             yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
         )
+        session_dir = home / ".hermes" / "webui" / "sessions"
+        session_dir.mkdir(parents=True)
+        session = {
+            "model": "deepseek-4.1-uncensored",
+            "model_provider": current_provider,
+            "messages": [{"role": "user", "content": "keep this history"}],
+        }
+        (session_dir / "old-session.json").write_text(
+            json.dumps(session), encoding="utf-8"
+        )
+        index = [{"session_id": "old-session", **session}]
+        (session_dir / "_index.json").write_text(
+            json.dumps(index), encoding="utf-8"
+        )
+
         old_home = terminal.HERMES_HOME
         terminal.HERMES_HOME = home
         try:
             terminal._post_auth_heal_and_restart(provider_hint)
-            return yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+            result = {
+                "config": yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")),
+                "session": json.loads((session_dir / "old-session.json").read_text(encoding="utf-8")),
+                "index": json.loads((session_dir / "_index.json").read_text(encoding="utf-8")),
+            }
+            return result
         finally:
             terminal.HERMES_HOME = old_home
 
 
 def main() -> None:
-    selected = run_case("openai-codex", "openai")
-    model = selected["model"]
-    assert model["provider"] == "openai-codex", model
-    assert model["base_url"] == "https://chatgpt.com/backend-api/codex", model
-    assert model["default"] == "gpt-5.5", model
-    assert selected["mcp_servers"]["cuebank"]["enabled"] is True, selected
-    assert selected["skills"]["create_dir"] == "/data/skills-created", selected
+    selected = run_case("openai-codex", "custom")
+    config = selected["config"]
+    assert config["model"]["provider"] == "openai-codex", config
+    assert config["model"]["base_url"] == "https://chatgpt.com/backend-api/codex", config
+    assert config["model"]["default"] == "gpt-5.5", config
+    assert config["mcp_servers"]["cuebank"]["enabled"] is True, config
+    assert config["skills"]["create_dir"] == "/data/skills-created", config
+    assert selected["session"]["model_provider"] == "openai-codex", selected
+    assert selected["session"]["model"] == "gpt-5.5", selected
+    assert selected["session"]["messages"][0]["content"] == "keep this history", selected
+    assert selected["index"][0]["model_provider"] == "openai-codex", selected
+    assert selected["index"][0]["model"] == "gpt-5.5", selected
 
-    unchanged = run_case(None, "openai")
-    assert unchanged["model"]["provider"] == "openai", unchanged
-    assert unchanged["model"]["default"] == "gpt-4o", unchanged
-    assert unchanged["mcp_servers"]["cuebank"]["enabled"] is True, unchanged
-    print("ok: explicit Codex OAuth switches active provider; unrelated config is preserved")
+    unchanged = run_case(None, "custom")
+    assert unchanged["config"]["model"]["provider"] == "custom", unchanged
+    assert unchanged["config"]["model"]["default"] == "gpt-4o", unchanged
+    assert unchanged["session"]["model_provider"] == "custom", unchanged
+    assert unchanged["session"]["model"] == "deepseek-4.1-uncensored", unchanged
+    assert unchanged["config"]["mcp_servers"]["cuebank"]["enabled"] is True, unchanged
+    print("ok: explicit Codex OAuth switches config and existing sessions; history and MCP config are preserved")
 
 
 if __name__ == "__main__":

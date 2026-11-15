@@ -229,6 +229,10 @@ def _post_auth_heal_and_restart(provider_hint: str | None = None) -> str:
             default_model = (mc.get("default") or "").strip()
             default_provider = (mc.get("provider") or "").strip()
             if default_model and default_provider:
+                # An explicit OAuth shortcut is a global provider choice.
+                # Move existing session defaults too, so reopening an old session
+                # cannot silently keep using the previous billable API provider.
+                force_session_provider = bool(provider_hint and provider_hint == default_provider)
                 sessions_dir = home / ".hermes" / "webui" / "sessions"
                 patched = 0
                 if sessions_dir.exists():
@@ -242,7 +246,7 @@ def _post_auth_heal_and_restart(provider_hint: str | None = None) -> str:
                         if not isinstance(s, dict):
                             continue
                         m = s.get("model") or ""
-                        if not s.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
+                        if force_session_provider or not s.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
                             s["model"] = default_model
                             s["model_provider"] = default_provider
                             sf.write_text(json.dumps(s), encoding="utf-8")
@@ -255,7 +259,7 @@ def _post_auth_heal_and_restart(provider_hint: str | None = None) -> str:
                             if not isinstance(e, dict):
                                 continue
                             m = e.get("model") or ""
-                            if not e.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
+                            if force_session_provider or not e.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
                                 e["model"] = default_model
                                 e["model_provider"] = default_provider
                         idx_p.write_text(json.dumps(idx), encoding="utf-8")
