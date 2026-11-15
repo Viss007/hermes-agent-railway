@@ -249,6 +249,88 @@ async def model_options(request: Request) -> JSONResponse:
 async def current_session(request: Request) -> JSONResponse:
     return await _runtime_json(request, f"/api/sessions/{_SESSION_ID}")
 
+
+async def model_test(request: Request) -> JSONResponse:
+    """Isolated, allowlisted tool-use test; never changes the primary session."""
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict):
+        return _error("Expected a JSON object", 400)
+    model = payload.get("model")
+    allowed_models = {"glm-5.3-flash-uncensored", "deepseek-v4.1-flash-uncensored"}
+    if model not in allowed_models:
+        return _error("Model is not in the isolated test allowlist", 400)
+    test_id = payload.get("test_id") or ("test-" + os.urandom(8).hex())
+    if not isinstance(test_id, str) or not _REQUEST_ID_RE.fullmatch(test_id):
+        return _error("test_id must contain 1-128 safe characters", 400)
+    session_id = "model-test-" + test_id[:90]
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    test_prompt = (
+        "Use your terminal tool exactly once to run Python that prints the literal "
+        "MODEL_TOOL_PASS. Do not run any other command and do not inspect files or "
+        "environment variables. After the tool returns, reply with only the captured "
+        "output string."
+    )
+    test_system = (
+        "This is an isolated model capability test. Use only the terminal tool for "
+        "the single harmless print operation requested. Do not inspect secrets or files."
+    )
+    try:
+        timeout = httpx.Timeout(300.0, connect=5.0, read=300.0, write=20.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            current = await client.get(f"{_API_BASE}/api/sessions/{session_id}", headers=headers)
+            if current.status_code == 404:
+                created = await client.post(
+                    f"{_API_BASE}/api/sessions",
+                    headers=headers,
+                    json={"id": session_id, "source": "api_server",
+                          "title": f"Isolated model test: {model}",
+                          "system_prompt": test_system},
+                )
+                if created.status_code not in (200, 201, 409):
+                    return _error(f"Test session creation returned HTTP {created.status_code}", 502)
+            elif current.status_code != 200:
+                return _error(f"Test session lookup returned HTTP {current.status_code}", 502)
+            locked = await client.post(
+                f"{_API_BASE}/api/sessions/{session_id}/model",
+                headers=headers,
+                json={"model": model, "provider": "openai-api"},
+            )
+            if locked.status_code != 200:
+                detail = " ".join((locked.text or "").split())[:800]
+                return _error(f"Model lock failed HTTP {locked.status_code}: {detail}", 502)
+            response = await client.post(
+                f"{_API_BASE}/api/sessions/{session_id}/chat",
+                headers={**headers, "Idempotency-Key": test_id},
+                json={"message": test_prompt, "system_message": test_system},
+            )
+        if response.status_code != 200:
+            detail = " ".join((response.text or "").split())[:1200]
+            return _error(f"Model test returned HTTP {response.status_code}: {detail}", 502)
+        result = response.json()
+        content = result.get("message", {}).get("content", "")
+        runtime = result.get("usage", {}).get("runtime", {})
+        return JSONResponse(
+            {"ok": True, "test_id": test_id, "session_id": session_id,
+             "requested_model": model, "provider": "openai-api",
+             "status": result.get("status"), "reply": content,
+             "runtime": runtime, "usage": result.get("usage", {})},
+            headers={"Cache-Control": "no-store"},
+        )
+    except httpx.TimeoutException:
+        return _error("Model test exceeded 300 seconds; inspect the isolated session before retrying", 504)
+    except httpx.HTTPError:
+        return _error("Hermes API server was unavailable during model test", 503)
+    except (ValueError, TypeError):
+        return _error("Model test response was invalid", 502)
+
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
