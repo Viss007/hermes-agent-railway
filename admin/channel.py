@@ -29,6 +29,8 @@ the reply concise and identify only genuine blockers. Follow normal safety, secu
 and approval requirements for irreversible or externally consequential actions."""
 
 _SESSION_ID = os.getenv("HERMES_CHATGPT_SESSION_ID", "chatgpt-operator-channel")
+_CHANNEL_MODEL = os.getenv("HERMES_CHATGPT_CHANNEL_MODEL", "gpt-6-luna")
+_CHANNEL_PROVIDER = os.getenv("HERMES_CHATGPT_CHANNEL_PROVIDER", "openai-codex")
 _API_HOST = os.getenv("API_SERVER_HOST", "127.0.0.1")
 _API_PORT = os.getenv("API_SERVER_PORT", "8642")
 _API_BASE = f"http://{_API_HOST}:{_API_PORT}"
@@ -164,7 +166,8 @@ async def health(request: Request) -> JSONResponse:
         return _error("Hermes API server is unavailable", 503)
     return JSONResponse(
         {"ok": True, "status": "ready", "session_id": _SESSION_ID,
-         "transport": "authenticated-local-api", "storage": "sqlite-persistent"},
+         "transport": "authenticated-local-api", "storage": "sqlite-persistent",
+         "model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -227,6 +230,18 @@ async def chat(request: Request) -> JSONResponse:
             timeout = httpx.Timeout(180.0, connect=5.0, read=180.0, write=15.0, pool=5.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 await _ensure_session(client, api_headers)
+                model_lock = await client.post(
+                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/model",
+                    headers=api_headers,
+                    json={"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
+                )
+                if model_lock.status_code != 200:
+                    await asyncio.to_thread(
+                        _finish, request_id, "failed",
+                        error=f"Hermes model selection returned HTTP {model_lock.status_code}",
+                        session_id=_SESSION_ID,
+                    )
+                    return _error(f"Hermes model selection returned HTTP {model_lock.status_code}", 502)
                 response = await client.post(
                     f"{_API_BASE}/api/sessions/{_SESSION_ID}/chat",
                     headers={**api_headers, "Idempotency-Key": request_id},
