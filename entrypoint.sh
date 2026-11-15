@@ -198,6 +198,60 @@ except Exception as exc:
 PY
 fi
 
+
+
+
+# One-time primary-agent handover. The selected OpenAI-compatible models
+# passed isolated terminal-tool acceptance via the configured OpenAI API
+# provider. Keep the original config backup and preserve unrelated settings.
+PRIMARY_MARKER="${HERMES_HOME}/.hermes/primary-agent-config-v1.json"
+if [ -f "${HERMES_HOME}/config.yaml" ] && [ ! -f "${PRIMARY_MARKER}" ]; then
+  python3 - <<PY
+import json, os, pathlib, shutil, yaml
+home = pathlib.Path("${HERMES_HOME}")
+config = home / "config.yaml"
+backup = home / "config.yaml.pre-primary-agent.bak"
+marker = pathlib.Path("${PRIMARY_MARKER}")
+cfg = yaml.safe_load(config.read_text()) or {}
+if not isinstance(cfg, dict):
+    raise SystemExit("config.yaml root is not a mapping")
+if not backup.exists():
+    shutil.copy2(config, backup)
+    os.chmod(backup, 0o600)
+model = cfg.setdefault("model", {})
+if not isinstance(model, dict):
+    raise SystemExit("config.yaml model section is not a mapping")
+base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+model["provider"] = "openai-api"
+model["default"] = "deepseek-v4.1-flash-uncensored"
+if base_url:
+    model["base_url"] = base_url
+servers = cfg.get("mcp_servers")
+disabled = []
+if isinstance(servers, dict):
+    for name in ("desktop-commander", "cuebank"):
+        item = servers.get(name)
+        if isinstance(item, dict):
+            item["enabled"] = False
+            disabled.append(name)
+tmp = config.with_name("config.yaml.primary-agent.tmp")
+tmp.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+os.chmod(tmp, 0o600)
+os.replace(tmp, config)
+marker.parent.mkdir(parents=True, exist_ok=True)
+marker.write_text(json.dumps({
+    "version": 1,
+    "provider": model["provider"],
+    "model": model["default"],
+    "disabled_mcp_servers": disabled,
+}, indent=2))
+os.chmod(marker, 0o600)
+os.chmod(config, 0o600)
+print("[entrypoint] primary-agent config applied: provider=openai-api, model=deepseek-v4.1-flash-uncensored")
+print("[entrypoint] disabled offline/unwanted MCP servers: " + ", ".join(disabled))
+PY
+fi
+
 # Self-heal: backfill stale `model: <other-provider>/<name>` and missing
 # model_provider on existing webui sessions, so users don't hit "No LLM
 # provider configured" when reopening sessions created before they configured
