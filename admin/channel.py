@@ -35,6 +35,9 @@ _API_HOST = os.getenv("API_SERVER_HOST", "127.0.0.1")
 _API_PORT = os.getenv("API_SERVER_PORT", "8642")
 _API_BASE = f"http://{_API_HOST}:{_API_PORT}"
 _LOCK = asyncio.Lock()
+_WORKER_TASK: asyncio.Task | None = None
+_WAKE_EVENT = asyncio.Event()
+_STOP_EVENT = asyncio.Event()
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
@@ -60,8 +63,20 @@ def _connect() -> sqlite3.Connection:
             reply TEXT,
             error TEXT,
             session_id TEXT,
+            message TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
+        )"""
+    )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    if "message" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN message TEXT")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS outbox (
+            message_id TEXT PRIMARY KEY,
+            message TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            acked_at REAL
         )"""
     )
     conn.commit()
@@ -90,7 +105,7 @@ def _error(message: str, status: int) -> JSONResponse:
                         headers={"Cache-Control": "no-store"})
 
 
-def _reserve(request_id: str, input_sha256: str) -> tuple[str, dict | None]:
+def _reserve(request_id: str, input_sha256: str, message: str) -> tuple[str, dict | None]:
     now = time.time()
     with closing(_connect()) as conn, conn:
         row = conn.execute(
@@ -103,9 +118,9 @@ def _reserve(request_id: str, input_sha256: str) -> tuple[str, dict | None]:
             return "existing", saved
         conn.execute(
             """INSERT INTO requests
-               (request_id, input_sha256, status, created_at, updated_at)
-               VALUES (?, ?, 'processing', ?, ?)""",
-            (request_id, input_sha256, now, now),
+               (request_id, input_sha256, status, message, created_at, updated_at)
+               VALUES (?, ?, 'queued', ?, ?, ?)""",
+            (request_id, input_sha256, message, now, now),
         )
     return "new", None
 
@@ -172,6 +187,138 @@ async def health(request: Request) -> JSONResponse:
     )
 
 
+
+def _claim_next() -> tuple[str, str] | None:
+    with closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT request_id, message FROM requests WHERE status = 'queued' "
+            "ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        conn.execute(
+            "UPDATE requests SET status='processing', error=NULL, updated_at=? "
+            "WHERE request_id=? AND status='queued'",
+            (time.time(), row["request_id"]),
+        )
+        conn.commit()
+        return row["request_id"], row["message"] or ""
+
+
+def _mark_stale_uncertain() -> None:
+    cutoff = time.time() - 1200
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE requests SET status='uncertain', "
+            "error='Worker stopped while request was processing; inspect Hermes session before retrying', "
+            "updated_at=? WHERE status='processing' AND updated_at < ?",
+            (time.time(), cutoff),
+        )
+
+
+async def _execute_request(request_id: str, message: str) -> None:
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        await asyncio.to_thread(_finish, request_id, "failed", error="API server key missing")
+        return
+    async with _LOCK:
+        try:
+            api_headers = {"Authorization": f"Bearer {api_key}"}
+            timeout = httpx.Timeout(900.0, connect=5.0, read=900.0, write=30.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                await _ensure_session(client, api_headers)
+                model_lock = await client.post(
+                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/model",
+                    headers=api_headers,
+                    json={"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
+                )
+                if model_lock.status_code != 200:
+                    await asyncio.to_thread(
+                        _finish, request_id, "failed",
+                        error=f"Hermes model selection returned HTTP {model_lock.status_code}",
+                        session_id=_SESSION_ID,
+                    )
+                    return
+                response = await client.post(
+                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/chat",
+                    headers={**api_headers, "Idempotency-Key": request_id},
+                    json={"message": message, "system_message": _SYSTEM_MESSAGE},
+                )
+            if response.status_code != 200:
+                await asyncio.to_thread(
+                    _finish, request_id, "failed",
+                    error=f"Hermes API returned HTTP {response.status_code}",
+                    session_id=_SESSION_ID,
+                )
+                return
+            result = response.json()
+            state = result.get("status", "completed")
+            content = result.get("message", {}).get("content", "")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            if state != "completed":
+                await asyncio.to_thread(
+                    _finish, request_id, "failed", reply=content,
+                    error=f"Hermes turn finished with status {state}", session_id=_SESSION_ID,
+                )
+                return
+            await asyncio.to_thread(
+                _finish, request_id, "completed", reply=content, session_id=_SESSION_ID,
+            )
+        except httpx.TimeoutException:
+            await asyncio.to_thread(
+                _finish, request_id, "uncertain",
+                error="Hermes API exceeded 900 seconds; inspect session history before retrying",
+                session_id=_SESSION_ID,
+            )
+        except httpx.HTTPError:
+            await asyncio.to_thread(
+                _finish, request_id, "failed", error="Could not reach the local Hermes API server",
+                session_id=_SESSION_ID,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                _finish, request_id, "failed", error="Hermes relay worker failed unexpectedly",
+                session_id=_SESSION_ID,
+            )
+
+
+async def _worker_loop() -> None:
+    await asyncio.to_thread(_mark_stale_uncertain)
+    while not _STOP_EVENT.is_set():
+        item = await asyncio.to_thread(_claim_next)
+        if item is not None:
+            request_id, message = item
+            await _execute_request(request_id, message)
+            continue
+        _WAKE_EVENT.clear()
+        try:
+            await asyncio.wait_for(_WAKE_EVENT.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def start_worker() -> None:
+    global _WORKER_TASK
+    _STOP_EVENT.clear()
+    if _WORKER_TASK is None or _WORKER_TASK.done():
+        _WORKER_TASK = asyncio.create_task(_worker_loop(), name="hermes-channel-worker")
+
+
+async def stop_worker() -> None:
+    global _WORKER_TASK
+    _STOP_EVENT.set()
+    _WAKE_EVENT.set()
+    if _WORKER_TASK is not None:
+        try:
+            await asyncio.wait_for(_WORKER_TASK, timeout=5.0)
+        except asyncio.TimeoutError:
+            _WORKER_TASK.cancel()
+        _WORKER_TASK = None
+
+
 async def chat(request: Request) -> JSONResponse:
     if not _authorized(request):
         return _error("Unauthorized", 401)
@@ -192,15 +339,13 @@ async def chat(request: Request) -> JSONResponse:
         return _error("message must be a non-empty string", 400)
     if len(message) > 20000:
         return _error("message exceeds the 20000 character limit", 413)
-
     request_id = request.headers.get("idempotency-key") or payload.get("request_id")
     if request_id is None:
         request_id = "cgpt-" + os.urandom(16).hex()
     if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
         return _error("request_id must contain 1-128 safe characters", 400)
-
     input_sha256 = hashlib.sha256(message.encode("utf-8")).hexdigest()
-    reservation, existing = await asyncio.to_thread(_reserve, request_id, input_sha256)
+    reservation, existing = await asyncio.to_thread(_reserve, request_id, input_sha256, message)
     if reservation == "conflict":
         return _error("request_id was already used with a different message", 409)
     if reservation == "existing" and existing is not None:
@@ -211,97 +356,78 @@ async def chat(request: Request) -> JSONResponse:
                  "reply": existing["reply"] or "", "replayed": True},
                 headers={"Cache-Control": "no-store"},
             )
-        if existing["status"] == "processing":
+        if existing["status"] in ("queued", "processing"):
             return JSONResponse(
-                {"ok": True, "status": "processing", "request_id": request_id,
+                {"ok": True, "status": existing["status"], "request_id": request_id,
                  "session_id": existing["session_id"] or _SESSION_ID},
                 status_code=202, headers={"Cache-Control": "no-store"},
             )
-        return _error(existing["error"] or "Previous request failed; inspect status before retrying", 502)
+        return _error(existing["error"] or "Previous request is not safe to replay", 409)
+    if _WORKER_TASK is None or _WORKER_TASK.done():
+        await start_worker()
+    _WAKE_EVENT.set()
+    return JSONResponse(
+        {"ok": True, "status": "queued", "request_id": request_id, "session_id": _SESSION_ID},
+        status_code=202, headers={"Cache-Control": "no-store"},
+    )
 
-    api_key = os.getenv("API_SERVER_KEY", "")
-    if not api_key:
-        await asyncio.to_thread(_finish, request_id, "failed", error="API server key missing")
-        return _error("Hermes API server key is not configured", 503)
 
-    async with _LOCK:
-        try:
-            api_headers = {"Authorization": f"Bearer {api_key}"}
-            timeout = httpx.Timeout(180.0, connect=5.0, read=180.0, write=15.0, pool=5.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                await _ensure_session(client, api_headers)
-                model_lock = await client.post(
-                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/model",
-                    headers=api_headers,
-                    json={"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
-                )
-                if model_lock.status_code != 200:
-                    await asyncio.to_thread(
-                        _finish, request_id, "failed",
-                        error=f"Hermes model selection returned HTTP {model_lock.status_code}",
-                        session_id=_SESSION_ID,
-                    )
-                    return _error(f"Hermes model selection returned HTTP {model_lock.status_code}", 502)
-                response = await client.post(
-                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/chat",
-                    headers={**api_headers, "Idempotency-Key": request_id},
-                    json={"message": message, "system_message": _SYSTEM_MESSAGE},
-                )
-            if response.status_code != 200:
-                await asyncio.to_thread(
-                    _finish, request_id, "failed",
-                    error=f"Hermes API returned HTTP {response.status_code}",
-                    session_id=_SESSION_ID,
-                )
-                return _error(f"Hermes agent returned HTTP {response.status_code}", 502)
-            result = response.json()
-            state = result.get("status", "completed")
-            content = result.get("message", {}).get("content", "")
-            if not isinstance(content, str):
-                content = json.dumps(content, ensure_ascii=False)
-            if state != "completed":
-                await asyncio.to_thread(
-                    _finish, request_id, "failed", reply=content,
-                    error=f"Hermes turn finished with status {state}", session_id=_SESSION_ID,
-                )
-                return JSONResponse(
-                    {"ok": False, "status": state, "request_id": request_id,
-                     "session_id": _SESSION_ID, "reply": content},
-                    status_code=502, headers={"Cache-Control": "no-store"},
-                )
-            await asyncio.to_thread(
-                _finish, request_id, "completed", reply=content, session_id=_SESSION_ID,
-            )
-            return JSONResponse(
-                {"ok": True, "status": "completed", "request_id": request_id,
-                 "session_id": _SESSION_ID, "reply": content,
-                 "usage": result.get("usage", {}), "replayed": False},
-                headers={"Cache-Control": "no-store"},
-            )
-        except httpx.TimeoutException:
-            # Do not replay automatically: the agent may still have completed the turn.
-            await asyncio.to_thread(
-                _finish, request_id, "processing",
-                error="Hermes response timed out; inspect request status before retrying",
-                session_id=_SESSION_ID,
-            )
-            return JSONResponse(
-                {"ok": True, "status": "processing", "request_id": request_id,
-                 "session_id": _SESSION_ID},
-                status_code=202, headers={"Cache-Control": "no-store"},
-            )
-        except httpx.HTTPError:
-            await asyncio.to_thread(
-                _finish, request_id, "failed", error="Could not reach the local Hermes API server",
-                session_id=_SESSION_ID,
-            )
-            return _error("Could not reach the local Hermes API server", 503)
-        except Exception:
-            await asyncio.to_thread(
-                _finish, request_id, "failed", error="Hermes relay failed unexpectedly",
-                session_id=_SESSION_ID,
-            )
-            return _error("Hermes relay failed unexpectedly", 502)
+async def post_outbox(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict):
+        return _error("Expected a JSON object", 400)
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip() or len(message) > 20000:
+        return _error("message must be 1-20000 characters", 400)
+    message_id = payload.get("message_id") or ("hermes-" + os.urandom(16).hex())
+    if not isinstance(message_id, str) or not _REQUEST_ID_RE.fullmatch(message_id):
+        return _error("message_id must contain 1-128 safe characters", 400)
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO outbox(message_id,message,created_at) VALUES(?,?,?)",
+            (message_id, message, time.time()),
+        )
+        row = conn.execute("SELECT message FROM outbox WHERE message_id=?", (message_id,)).fetchone()
+    if row is None or row["message"] != message:
+        return _error("message_id already exists with different content", 409)
+    return JSONResponse({"ok": True, "message_id": message_id, "status": "stored"},
+                        status_code=201, headers={"Cache-Control": "no-store"})
+
+
+async def get_outbox(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "50"))))
+    except ValueError:
+        return _error("limit must be an integer", 400)
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT message_id,message,created_at FROM outbox WHERE acked_at IS NULL "
+            "ORDER BY created_at LIMIT ?", (limit,)
+        ).fetchall()
+    return JSONResponse({"ok": True, "messages": [dict(row) for row in rows]},
+                        headers={"Cache-Control": "no-store"})
+
+
+async def ack_outbox(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    message_id = request.path_params.get("message_id", "")
+    if not isinstance(message_id, str) or not _REQUEST_ID_RE.fullmatch(message_id):
+        return _error("Invalid message_id", 400)
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute(
+            "UPDATE outbox SET acked_at=? WHERE message_id=? AND acked_at IS NULL",
+            (time.time(), message_id),
+        )
+    return JSONResponse({"ok": True, "acked": cur.rowcount == 1, "message_id": message_id},
+                        headers={"Cache-Control": "no-store"})
 
 
 async def get_request(request: Request) -> JSONResponse:

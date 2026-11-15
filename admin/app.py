@@ -50,6 +50,9 @@ routes = [
     Route("/agent-channel/health", chatgpt_channel.health, methods=["GET"]),
     Route("/agent-channel/chat", chatgpt_channel.chat, methods=["POST"]),
     Route("/agent-channel/requests/{request_id}", chatgpt_channel.get_request, methods=["GET"]),
+    Route("/agent-channel/outbox", chatgpt_channel.get_outbox, methods=["GET"]),
+    Route("/agent-channel/outbox", chatgpt_channel.post_outbox, methods=["POST"]),
+    Route("/agent-channel/outbox/{message_id}/ack", chatgpt_channel.ack_outbox, methods=["POST"]),
     WebSocketRoute("/tui/ws/auth/{provider}", hermes_terminal.login_ws),
     WebSocketRoute("/tui/ws/shell", hermes_terminal.shell_ws),
     Mount(DASHBOARD_MOUNT_PREFIX, build_dashboard_starlette_app()),
@@ -59,4 +62,4 @@ routes = [
     Route("/", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
 ]
 
-app = Starlette(debug=False, routes=routes)
+app = Starlette(debug=False, routes=routes, on_startup=[chatgpt_channel.start_worker], on_shutdown=[chatgpt_channel.stop_worker])
