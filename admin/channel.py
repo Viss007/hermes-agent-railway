@@ -321,11 +321,14 @@ async def model_test(request: Request) -> JSONResponse:
                     f"{_API_BASE}/api/sessions",
                     headers=headers,
                     json={"id": session_id, "source": "api_server",
-                          "title": f"Isolated model test: {model}",
+                          "title": "Model capability test",
                           "system_prompt": test_system},
                 )
                 if created.status_code not in (200, 201, 409):
-                    return _error(f"Test session creation returned HTTP {created.status_code}", 502)
+                    detail = " ".join((created.text or "").split())[:1000]
+                    return _error(
+                        f"Test session creation returned HTTP {created.status_code}: {detail}", 502
+                    )
             elif current.status_code != 200:
                 return _error(f"Test session lookup returned HTTP {current.status_code}", 502)
             locked = await client.post(
