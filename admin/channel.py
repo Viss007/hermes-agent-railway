@@ -361,6 +361,74 @@ async def model_test(request: Request) -> JSONResponse:
     except (ValueError, TypeError):
         return _error("Model test response was invalid", 502)
 
+
+async def diagnostics(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    home = Path(os.getenv("HERMES_HOME", "/data"))
+    cfg_path = home / "config.yaml"
+    auth_path = home / "auth.json"
+    cfg = {}
+    try:
+        import yaml
+        cfg = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    base_url = str(model_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL", ""))
+    from urllib.parse import urlsplit
+    try:
+        base_host = urlsplit(base_url).hostname if base_url else None
+    except ValueError:
+        base_host = "invalid"
+    mcp_cfg = cfg.get("mcp_servers") or cfg.get("mcpServers") or cfg.get("mcp") or {}
+    mcp_servers = []
+    if isinstance(mcp_cfg, dict):
+        for name, value in mcp_cfg.items():
+            item = value if isinstance(value, dict) else {}
+            raw_url = str(item.get("url") or item.get("server_url") or "")
+            try:
+                host = urlsplit(raw_url).hostname if raw_url else None
+            except ValueError:
+                host = "invalid"
+            command = str(item.get("command") or "")
+            mcp_servers.append({
+                "name": str(name)[:100],
+                "enabled": item.get("enabled", True),
+                "transport": str(item.get("transport") or item.get("type") or ("http" if raw_url else "stdio" if command else "unknown"))[:40],
+                "host": host,
+                "command": Path(command).name if command else None,
+            })
+    auth_providers = []
+    try:
+        auth = json.loads(auth_path.read_text()) if auth_path.exists() else {}
+        providers = auth.get("providers", {}) if isinstance(auth, dict) else {}
+        if isinstance(providers, dict):
+            auth_providers = sorted(str(x) for x in providers.keys())
+    except Exception:
+        auth_providers = ["unreadable"]
+    secret_name_prefixes = ("MCP_", "PERSONAL_CONTROL_", "COMPOSIO_", "OPENAI_", "GLM_", "DEEPSEEK_", "XAI_", "FIREWORKS_", "NOVITA_", "ANTHROPIC_", "GOOGLE_", "GITHUB_", "GMAIL_")
+    configured_env_names = sorted(
+        name for name, value in os.environ.items()
+        if name.startswith(secret_name_prefixes) and bool(value)
+    )
+    def dirs(path: Path) -> list[str]:
+        try:
+            return sorted(x.name for x in path.iterdir() if x.is_dir())[:100]
+        except OSError:
+            return []
+    return JSONResponse({
+        "ok": True,
+        "home": str(home),
+        "model": {"provider": model_cfg.get("provider"), "default": model_cfg.get("default"),
+                  "base_url_host": base_host},
+        "auth_providers": auth_providers,
+        "mcp_servers": mcp_servers,
+        "configured_secret_env_names": configured_env_names,
+        "skills_dirs": {"skills": dirs(home / "skills"), "hermes_skills": dirs(home / ".hermes" / "skills")},
+        "channel": {"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
+    }, headers={"Cache-Control": "no-store"})
+
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
