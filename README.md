@@ -114,9 +114,10 @@ SearXNG can be private-only if Hermes is the only consumer. Keep public HTTP ena
 1. Deploy the two-service template.
 2. Open the Hermes Agent public Railway URL.
 3. Enter the WebUI password (your `ADMIN_PASSWORD` if set; otherwise retrieve it once from `/data/admin.password` or deploy logs — see deploy variables table).
-4. The WebUI's onboarding wizard launches — pick a provider, paste an API key, choose a default model. Configuration is written to `/data/.env` and `/data/config.yaml`.
-5. Send your first message in the chat.
-6. (Optional) To enable Telegram/Discord/Slack/email bridges, configure the channel tokens in **Settings**, then redeploy with `START_GATEWAY=true`.
+4. For ChatGPT subscription access, visit `/tui` and click **Login with ChatGPT (Codex)**. Complete the OpenAI device-code sign-in privately in your browser. This uses ChatGPT OAuth, not `OPENAI_API_KEY` or API billing; usage remains subject to your ChatGPT plan's Codex limits.
+5. For API-key providers, use the WebUI onboarding wizard: pick a provider, paste its API key, choose a default model. Configuration is written to `/data/.env` and `/data/config.yaml`.
+6. Send your first message in the chat.
+7. (Optional) To enable messaging bridges, configure channel credentials in **Settings**, then redeploy with `START_GATEWAY=true`.
 
 ## SearXNG Search
 
@@ -220,6 +221,7 @@ The wrapper sets **`X-Forwarded-Prefix: /hermes-dashboard`** when forwarding to 
 
 - **Ports:** The public Railway listener stays **`PORT`**. Hermes WebUI listens on **`HERMES_WEBUI_HOST`/`HERMES_WEBUI_PORT`** (default **127.0.0.1:9120**) and is reverse-proxied from **`/`**. The **`hermes dashboard`** subprocess defaults to **`127.0.0.1:9119`** (see **`HERMES_DASHBOARD_*`** defaults in [`entrypoint.sh`](./entrypoint.sh)); traffic is surfaced at **`HERMES_DASHBOARD_MOUNT_PATH`**, not via a separate Railway port.
 - **Skills at boot:** Upstream Docker runs `tools/skills_sync.py` from the Hermes install tree to mirror bundled skills onto the volume. This template does **not** run that script; only bundles under [`hermes-agent-railway/skills/`](./skills/) are copied into `/data/skills` each start. Operators who expect **all** upstream stock skills mirrored should sync them manually or adjust the deployment.
-- Hermes Agent is installed from upstream `NousResearch/hermes-agent` (`ARG HERMES_REF=v2026.6.5`). Override with any valid branch, tag, or SHA.
-- Hermes WebUI is pinned to a specific tag (`ARG HERMES_WEBUI_REF=v0.51.310`). Override to upgrade.
+- Hermes Agent is pinned to upstream release `v0.23.1` (`3b421578588243f920886e6fe79a6faa87ea026e`) with a build-time commit assertion (`HERMES_REF` + `HERMES_COMMIT`).
+- Hermes WebUI is pinned to tag `v0.51.310` (`ARG HERMES_WEBUI_REF`).
+- Hermes' Node and pnpm toolchains are pinned and SHA-256 verified: Node `26.12.1`, pnpm `12.15.0`.
 - `/data` stores config, `.env`, sessions, memories, skills, workspace files, logs, and WebUI state.

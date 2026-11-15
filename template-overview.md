@@ -57,7 +57,7 @@ Upstream Docker images run `tools/skills_sync.py` from the Hermes install direct
 
 ## Dependencies for Hermes Agent Hosting
 
-- **Hermes Agent**: Installed from `https://github.com/NousResearch/hermes-agent` (pinned via `HERMES_REF=v2026.6.5`).
+- **Hermes Agent**: Installed from `https://github.com/NousResearch/hermes-agent` at stable release `v0.23.1` (commit `3b421578588243f920886e6fe79a6faa87ea026e`), pinned via `HERMES_REF` + `HERMES_COMMIT`.
 - **Hermes WebUI**: Installed from `https://github.com/nesquena/hermes-webui` (pinned via `HERMES_WEBUI_REF=v0.51.310`).
 - **Prebuilt image**: the template deploys `ghcr.io/protemplate/hermes-agent-railway`, built by GitHub Actions from [protemplate/hermes-agent-railway](https://github.com/protemplate/hermes-agent-railway), so there is no build step on your account and a deploy takes a couple of minutes.
 - **Plan**: Hobby or higher is recommended. Hermes idles at about 200 MB, but its browser tool starts Chromium, which can push it past the Free plan's 0.5 GB per service.
@@ -67,7 +67,7 @@ Upstream Docker images run `tools/skills_sync.py` from the Hermes install direct
 
 ### Deployment Dependencies
 
-- Runtime: Python 3.13, Node.js, uv
+- Runtime: Python 3.13 image base, Node.js 26.12.1, pnpm 12.15.0, uv
 - Web UI: Hermes WebUI (Python stdlib + vanilla JS, no build step)
 - Browser tooling: Playwright Chromium (agent-side, used when Hermes invokes the browser tool)
 - Health check: `/health`

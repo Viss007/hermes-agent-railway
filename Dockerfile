@@ -1,44 +1,55 @@
 FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie-slim
 
-ARG HERMES_REF=v2026.6.5
+ARG HERMES_REF=v0.23.1
+ARG HERMES_COMMIT=3b421578588243f920886e6fe79a6faa87ea026e
 ARG HERMES_WEBUI_REF=v0.51.310
+ARG NODE_VERSION=26.12.1
+ARG NODE_SHA256=6170b2d474e1c626f43cff3adc118df9fe3b573258a4fc3d850c8dbc6b079bbd
+ARG PNPM_VERSION=12.15.0
+ARG PNPM_SHA256=f5173f6127cc505cdb36ec17719fe54a8511c6fd8560c7ceb4bf7c73e3b4458b
 
 ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright \
     HERMES_HOME=/data \
-    PATH="/opt/hermes/.venv/bin:/data/.local/bin:${PATH}" \
+    PATH="/opt/node-v${NODE_VERSION}-linux-x64/bin:/opt/hermes/.venv/bin:/data/.local/bin:${PATH}" \
     PYTHONPATH="/opt/hermes-railway:/opt/hermes:/opt/hermes-webui"
 
 # The second group is everyday tools the agent's shell and user skills may call. They came
 # with the full python base image this used to build on, so keep them for existing setups.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      build-essential \
       ca-certificates \
       curl \
-      docker-cli \
       ffmpeg \
-      gcc \
       git \
       gosu \
-      libffi-dev \
-      nodejs \
-      npm \
       openssh-client \
       procps \
-      python3 \
-      python3-dev \
       ripgrep \
       tini \
       file \
       gnupg \
       imagemagick \
-      mercurial \
-      pkg-config \
-      subversion \
       unzip \
-      wget && \
+      wget \
+      xz-utils && \
     rm -rf /var/lib/apt/lists/*
+
+# Hermes v0.23.1 pins Node and pnpm in its pm/lock.json. Keep those toolchains
+# aligned with the exact upstream lock rather than Debian's older Node package.
+RUN set -eux; \
+    curl -fsSL --retry 3 -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"; \
+    printf '%s  %s\n' "${NODE_SHA256}" /tmp/node.tar.xz | sha256sum -c -; \
+    tar -xJf /tmp/node.tar.xz -C /opt; \
+    rm /tmp/node.tar.xz; \
+    node --version; npm --version
+
+RUN set -eux; \
+    curl -fsSL --retry 3 -o /tmp/pnpm.tgz "https://registry.npmjs.org/pnpm/-/pnpm-${PNPM_VERSION}.tgz"; \
+    printf '%s  %s\n' "${PNPM_SHA256}" /tmp/pnpm.tgz | sha256sum -c -; \
+    npm install --global --no-audit --no-fund /tmp/pnpm.tgz; \
+    test "$(pnpm --version)" = "${PNPM_VERSION}"; \
+    rm /tmp/pnpm.tgz
 
 # Railway's Trial and Free plans reject images over 4 GB. Keep this image well under it:
 # the app directories are owned by `hermes` before anything is written into them, and
@@ -56,18 +67,18 @@ WORKDIR /opt/hermes
 RUN git init . && \
     git remote add origin https://github.com/NousResearch/hermes-agent.git && \
     (git fetch --depth 1 origin "${HERMES_REF}" || git fetch --depth 1 origin "refs/tags/${HERMES_REF}:refs/tags/${HERMES_REF}") && \
-    git checkout --detach FETCH_HEAD
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${HERMES_COMMIT}"
 
 ENV npm_config_install_links=false
 
 # Root dependencies (agent-browser) plus the web dashboard and TUI workspaces, which
 # Hermes builds with npm on first use. The apps/* workspaces are skipped: they are the
 # Electron desktop app and its installers (about 600 MB), used only by `hermes desktop`.
-RUN npm install --prefer-offline --no-audit --include-workspace-root \
-      --workspace web \
-      --workspace ui-tui \
-      --workspace ui-tui/packages/hermes-ink && \
-    npm cache clean --force && \
+RUN pnpm install --frozen-lockfile --trust-lockfile --prod=false \
+      --filter '{./ui-tui}...' \
+      --filter '{./web}...' && \
+    pnpm store prune && \
     rm -rf /home/hermes/.cache
 
 # Chromium's system libraries need root; the browser itself goes to
@@ -107,7 +118,8 @@ COPY --chown=hermes:hermes admin ./admin
 COPY --chown=hermes:hermes skills ./skills
 COPY --chown=hermes:hermes entrypoint.sh ./entrypoint.sh
 
-RUN chmod +x /opt/hermes-railway/entrypoint.sh && \
+RUN sed -i 's/\r$//' /opt/hermes-railway/entrypoint.sh && \
+    chmod +x /opt/hermes-railway/entrypoint.sh && \
     git config --system --add safe.directory /opt/hermes && \
     git config --system --add safe.directory /opt/hermes-webui
 
