@@ -265,7 +265,10 @@ async def model_test(request: Request) -> JSONResponse:
     if model not in allowed_models:
         return _error("Model is not in the isolated test allowlist", 400)
     test_kind = payload.get("test_kind", "terminal")
-    allowed_kinds = {"terminal", "file", "browser", "web", "connections", "bridge"}
+    allowed_kinds = {
+        "terminal", "file", "browser", "web", "connections", "bridge",
+        "bridge_phone", "bridge_files",
+    }
     if test_kind not in allowed_kinds:
         return _error("test_kind is not in the isolated test allowlist", 400)
     test_id = payload.get("test_id") or ("test-" + os.urandom(8).hex())
@@ -305,12 +308,28 @@ async def model_test(request: Request) -> JSONResponse:
             "bridge_health for read-only checks. Do not use terminal or any fallback. "
             "Return the exact tool names and result statuses."
         ),
+        "bridge_phone": (
+            "Use Personal Control Bridge tools only. Call bridge_whoami and bridge_health. "
+            "Discover the registered Pixel device ID from those results. Then use bridge_enqueue "
+            "for phone.node.status and phone.a11y.status, polling bridge_command_status for each "
+            "until a terminal receipt. Follow each tool's declared schema; do not guess parameter names. "
+            "Do not use a terminal, UI snapshot, tap, typing or Desktop Commander. Return the device ID, "
+            "tool names, command IDs and terminal PASS/FAIL results."
+        ),
+        "bridge_files": (
+            "Use Personal Control Bridge tools only. Call bridge_whoami and bridge_health. "
+            "Use bridge_enqueue to write BRIDGE_FILE_PASS to acceptance/hermes-bridge-proof.txt "
+            "in the phone agent workspace, read it back, then delete that exact test file using "
+            "the declared confirmation field. Poll bridge_command_status after every command until "
+            "terminal receipts. Follow the tool schemas; do not guess parameter names. Do not use "
+            "terminal, Desktop Commander or direct HTTP. Return the exact readback and deletion result."
+        ),
     }
     test_prompt = test_prompts[test_kind]
     test_system = (
-        "This is an isolated model capability test. Use only the specifically named tool "
-        "for this test. Do not inspect secrets, credentials, unrelated files or personal data. "
-        "Do not use another tool as a fallback."
+        "This is an isolated model capability test. Use only the tools explicitly named "
+        "in the test instructions. Do not inspect secrets, credentials, unrelated files or "
+        "personal data. Do not use another tool as a fallback."
     )
     try:
         timeout = httpx.Timeout(300.0, connect=5.0, read=300.0, write=20.0, pool=10.0)
@@ -321,7 +340,7 @@ async def model_test(request: Request) -> JSONResponse:
                     f"{_API_BASE}/api/sessions",
                     headers=headers,
                     json={"id": session_id, "source": "api_server",
-                          "title": "Model capability test",
+                          "title": f"Model test {test_id}",
                           "system_prompt": test_system},
                 )
                 if created.status_code not in (200, 201, 409):
