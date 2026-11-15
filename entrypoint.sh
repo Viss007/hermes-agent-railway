@@ -131,7 +131,7 @@ PROVIDER_BASE = {
     "nous": "https://inference-api.nousresearch.com/v1",
 }
 PROVIDER_DEFAULT_MODEL = {
-    "openai-codex": "gpt-5.5",
+    "openai-codex": "gpt-6-luna",
     "nous": "Hermes-3-Llama-3.1-70B-FP8",
 }
 
@@ -171,6 +171,33 @@ print(f"[entrypoint] wrote config.yaml: model.provider={chosen}, default={model_
 PY
 fi
 
+# GPT-5.5 retired for ChatGPT-authenticated Codex on 2026-10-14.
+# Migrate only this exact retired default for the openai-codex provider.
+# Keep a one-time backup of the user's original config before changing it.
+if [ -f "${HERMES_HOME}/config.yaml" ]; then
+  python3 - <<PY || true
+import os, pathlib, shutil, yaml
+p = pathlib.Path("${HERMES_HOME}/config.yaml")
+try:
+    cfg = yaml.safe_load(p.read_text()) or {}
+    model = cfg.get("model") or {}
+    if model.get("provider") == "openai-codex" and model.get("default") == "gpt-5.5":
+        backup = p.with_name("config.yaml.pre-gpt55-retirement.bak")
+        if not backup.exists():
+            shutil.copy2(p, backup)
+            os.chmod(backup, 0o600)
+        model["default"] = "gpt-6-luna"
+        cfg["model"] = model
+        tmp = p.with_name("config.yaml.retirement.tmp")
+        tmp.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+        print("[entrypoint] migrated openai-codex default gpt-5.5 -> gpt-6-luna (backup retained)")
+except Exception as exc:
+    print(f"[entrypoint] Codex model migration skipped: {type(exc).__name__}")
+PY
+fi
+
 # Self-heal: backfill stale `model: <other-provider>/<name>` and missing
 # model_provider on existing webui sessions, so users don't hit "No LLM
 # provider configured" when reopening sessions created before they configured
@@ -199,6 +226,7 @@ for p in glob.glob("${SESSIONS_DIR}/*.json"):
     needs_fix = (
         not s.get("model_provider")
         or ("/" in m and not m.startswith(default_provider + "/"))
+        or (default_provider == "openai-codex" and m == "gpt-5.5")
     )
     if needs_fix:
         s["model"] = default_model
@@ -215,7 +243,9 @@ if idx_p.exists():
             if not isinstance(e, dict):
                 continue
             m = e.get("model") or ""
-            if not e.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
+            if (not e.get("model_provider")
+                or ("/" in m and not m.startswith(default_provider + "/"))
+                or (default_provider == "openai-codex" and m == "gpt-5.5")):
                 e["model"] = default_model
                 e["model_provider"] = default_provider
                 idx_patched += 1
