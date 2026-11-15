@@ -116,6 +116,7 @@ WORKDIR /opt/hermes-railway
 
 COPY --chown=hermes:hermes admin ./admin
 COPY --chown=hermes:hermes skills ./skills
+COPY --chown=hermes:hermes profile ./profile
 COPY --chown=hermes:hermes entrypoint.sh ./entrypoint.sh
 
 RUN sed -i 's/\r$//' /opt/hermes-railway/entrypoint.sh && \

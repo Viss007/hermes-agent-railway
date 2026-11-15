@@ -19,6 +19,7 @@ A single password-protected web UI on the Railway public domain ([screenshots](h
 - **Model picker, profile switcher, configurable model badges** in the composer footer
 - **Session search**, slash-command autocomplete, streaming SSE responses, multi-modal uploads
 - **Persistent state** on the `/data` volume — config, sessions, skills, workspace, WebUI state
+- **Viss primary-operator profile** — seeds `SOUL.md` and `memories/USER.md` on a fresh volume only; an existing user identity or memory file is never overwritten
 - **Bundled `searxng-local` skill** so Hermes can query the companion SearXNG service
 - **Official Hermes CLI dashboard** reachable at **`/hermes-dashboard`** on your Railway URL while `hermes dashboard --no-open` runs on loopback inside the container (Hermes SPA expects **`X-Forwarded-Prefix`**; see `admin/dashboard_proxy.py`).
 - **Health check** at `/health` (Railway probe)
@@ -225,3 +226,4 @@ The wrapper sets **`X-Forwarded-Prefix: /hermes-dashboard`** when forwarding to 
 - Hermes WebUI is pinned to tag `v0.51.310` (`ARG HERMES_WEBUI_REF`).
 - Hermes' Node and pnpm toolchains are pinned and SHA-256 verified: Node `26.12.1`, pnpm `12.15.0`.
 - `/data` stores config, `.env`, sessions, memories, skills, workspace files, logs, and WebUI state.
+- The Viss operator profile is seeded only when `/data/SOUL.md` or `/data/memories/USER.md` is absent. Redeploys preserve existing user-authored files and evolving Hermes memory.

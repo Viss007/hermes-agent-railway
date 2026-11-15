@@ -88,8 +88,21 @@ print("[entrypoint] reset onboarding_completed (no .env, no OAuth)")
 PY
 fi
 
-if [ ! -f "${HERMES_HOME}/SOUL.md" ] && [ -f "/opt/hermes/docker/SOUL.md" ]; then
-  cp /opt/hermes/docker/SOUL.md "${HERMES_HOME}/SOUL.md"
+# Seed the Viss operator identity and user profile only on a fresh volume.
+# Never overwrite existing identity or memory files on redeploy.
+if [ ! -e "${HERMES_HOME}/SOUL.md" ]; then
+  if [ -s "/opt/hermes-railway/profile/SOUL.md" ]; then
+    cp /opt/hermes-railway/profile/SOUL.md "${HERMES_HOME}/SOUL.md"
+    echo "[entrypoint] seeded primary-operator SOUL.md"
+  elif [ -f "/opt/hermes/docker/SOUL.md" ]; then
+    cp /opt/hermes/docker/SOUL.md "${HERMES_HOME}/SOUL.md"
+  fi
+fi
+
+USER_MEMORY_FILE="${HERMES_HOME}/memories/USER.md"
+if [ ! -e "${USER_MEMORY_FILE}" ] && [ -s "/opt/hermes-railway/profile/memories/USER.md" ]; then
+  cp /opt/hermes-railway/profile/memories/USER.md "${USER_MEMORY_FILE}"
+  echo "[entrypoint] seeded initial USER.md"
 fi
 
 # Self-heal: hermes-webui caches its model catalog at this path for 24 hours.
