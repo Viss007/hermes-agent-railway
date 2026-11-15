@@ -558,8 +558,16 @@ async def _execute_request(request_id: str, message: str) -> None:
                 )
                 return
             result = response.json()
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Unexpected Hermes API response type: {type(result).__name__}")
             state = result.get("status", "completed")
-            content = result.get("message", {}).get("content", "")
+            message_obj = result.get("message", {})
+            if isinstance(message_obj, dict):
+                content = message_obj.get("content", "")
+            elif isinstance(message_obj, str):
+                content = message_obj
+            else:
+                content = result.get("reply", "")
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False)
             if state != "completed":
@@ -582,9 +590,13 @@ async def _execute_request(request_id: str, message: str) -> None:
                 _finish, request_id, "failed", error="Could not reach the local Hermes API server",
                 session_id=_SESSION_ID,
             )
-        except Exception:
+        except Exception as exc:
+            detail = " ".join(str(exc).split())[:400]
+            detail = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._-]+", r"\1[redacted]", detail)
+            detail = re.sub(r"(?i)(api[_-]?key[=: ]+)[^\s,;]+", r"\1[redacted]", detail)
             await asyncio.to_thread(
-                _finish, request_id, "failed", error="Hermes relay worker failed unexpectedly",
+                _finish, request_id, "failed",
+                error=f"Hermes relay worker failed: {type(exc).__name__}: {detail}",
                 session_id=_SESSION_ID,
             )
 
