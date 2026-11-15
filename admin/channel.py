@@ -463,10 +463,11 @@ async def configure_primary(request: Request) -> JSONResponse:
         mcp_cfg = cfg.get("mcp_servers")
         disabled = []
         if isinstance(mcp_cfg, dict):
-            dc = mcp_cfg.get("desktop-commander")
-            if isinstance(dc, dict):
-                dc["enabled"] = False
-                disabled.append("desktop-commander")
+            for server_name in ("desktop-commander", "cuebank"):
+                server_cfg = mcp_cfg.get(server_name)
+                if isinstance(server_cfg, dict):
+                    server_cfg["enabled"] = False
+                    disabled.append(server_name)
         if not backup_path.exists():
             backup_path.write_text(original)
             os.chmod(backup_path, 0o600)
