@@ -67,6 +67,7 @@ def test_app_registers_outbox_and_worker_lifecycle():
     from admin.app import app
 
     paths = {route.path: set(getattr(route, "methods", []) or []) for route in app.routes}
+    assert paths["/agent-channel/capabilities"] == {"GET"}
     assert paths["/agent-channel/outbox"] == {"GET", "POST"}
     assert paths["/agent-channel/outbox/{message_id}/ack"] == {"POST"}
     assert getattr(app.router.lifespan_context, "__name__", "") == "lifespan"

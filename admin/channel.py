@@ -188,6 +188,27 @@ async def health(request: Request) -> JSONResponse:
 
 
 
+
+async def capabilities(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=3.0)) as client:
+            response = await client.get(
+                f"{_API_BASE}/v1/capabilities",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if response.status_code != 200:
+            return _error(f"Hermes capabilities returned HTTP {response.status_code}", 502)
+        return JSONResponse(response.json(), headers={"Cache-Control": "no-store"})
+    except httpx.HTTPError:
+        return _error("Hermes capabilities endpoint is unavailable", 503)
+    except ValueError:
+        return _error("Hermes capabilities response was invalid JSON", 502)
+
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -247,9 +268,10 @@ async def _execute_request(request_id: str, message: str) -> None:
                     json={"message": message, "system_message": _SYSTEM_MESSAGE},
                 )
             if response.status_code != 200:
+                detail = " ".join((response.text or "").split())[:1200]
                 await asyncio.to_thread(
                     _finish, request_id, "failed",
-                    error=f"Hermes API returned HTTP {response.status_code}",
+                    error=f"Hermes API returned HTTP {response.status_code}: {detail}",
                     session_id=_SESSION_ID,
                 )
                 return

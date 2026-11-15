@@ -49,6 +49,7 @@ async def tui_page(request: Request):
 routes = [
     Route("/tui", tui_page, methods=["GET"]),
     Route("/agent-channel/health", chatgpt_channel.health, methods=["GET"]),
+    Route("/agent-channel/capabilities", chatgpt_channel.capabilities, methods=["GET"]),
     Route("/agent-channel/chat", chatgpt_channel.chat, methods=["POST"]),
     Route("/agent-channel/requests/{request_id}", chatgpt_channel.get_request, methods=["GET"]),
     Route("/agent-channel/outbox", chatgpt_channel.get_outbox, methods=["GET"]),
