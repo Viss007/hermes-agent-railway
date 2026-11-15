@@ -5,6 +5,7 @@ All ordinary WebUI paths remain reverse-proxied to hermes-webui.
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -62,4 +63,13 @@ routes = [
     Route("/", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
 ]
 
-app = Starlette(debug=False, routes=routes, on_startup=[chatgpt_channel.start_worker], on_shutdown=[chatgpt_channel.stop_worker])
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    await chatgpt_channel.start_worker()
+    try:
+        yield
+    finally:
+        await chatgpt_channel.stop_worker()
+
+
+app = Starlette(debug=False, routes=routes, lifespan=lifespan)
