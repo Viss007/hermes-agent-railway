@@ -242,6 +242,13 @@ async def skills(request: Request) -> JSONResponse:
 async def models(request: Request) -> JSONResponse:
     return await _runtime_json(request, "/v1/models")
 
+async def model_options(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/api/model/options")
+
+
+async def current_session(request: Request) -> JSONResponse:
+    return await _runtime_json(request, f"/api/sessions/{_SESSION_ID}")
+
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
