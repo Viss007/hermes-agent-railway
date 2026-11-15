@@ -181,7 +181,7 @@ Open `http://localhost:8080` and enter `changeme` at the password prompt.
 
 `/tui` is a two-pane web terminal: a left rail of preset buttons (OAuth login, status commands, file viewers, "Open shell") and a right pane with xterm.js. Behind it are two WebSocket modes:
 
-- **OAuth one-shots** (`/tui/ws/auth/<provider>`) — clicking an OAuth button spawns a dedicated PTY running `hermes auth add <provider> --type oauth --no-browser`. On clean exit, the wrapper writes `model.provider` into `/data/config.yaml`, marks onboarding complete, restarts hermes-webui, and the page redirects you to `/`.
+- **OAuth one-shots** (`/tui/ws/auth/<provider>`) — clicking an OAuth button spawns a dedicated PTY running `hermes auth add <provider> --type oauth --no-browser`. On clean exit, the wrapper selects the provider you explicitly authenticated, updates the provider endpoint and default model, preserves unrelated config such as existing MCP servers, marks onboarding complete, restarts hermes-webui, and the page redirects you to `/`. This ensures a successful ChatGPT Codex login actually switches new sessions away from an older API-key provider.
 - **Shell** (`/tui/ws/shell`) — clicking "Open shell" or any non-OAuth preset spawns `/bin/bash -i` with `cwd=/data` and Hermes' venv on PATH. Run `hermes status`, `hermes auth list`, `cat /data/config.yaml`, `tail .../webui.log` — anything you'd run over SSH.
 
 ### `hermes update` from the Web Terminal

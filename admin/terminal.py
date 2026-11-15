@@ -74,7 +74,8 @@ async def login_ws(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
-    await _bridge(websocket, argv, run_heal_on_success=True)
+    provider_hint = provider if provider in ALLOWED_PROVIDERS else None
+    await _bridge(websocket, argv, run_heal_on_success=True, provider_hint=provider_hint)
 
 
 async def shell_ws(websocket: WebSocket) -> None:
@@ -126,11 +127,12 @@ _PROVIDER_DEFAULT_MODEL = {
 }
 
 
-def _post_auth_heal_and_restart() -> str:
-    """After a successful auth/model command, normalize state and restart hermes-webui.
+def _post_auth_heal_and_restart(provider_hint: str | None = None) -> str:
+    """After a successful OAuth/model command, normalize state and restart hermes-webui.
 
-    1. If config.yaml lacks model.provider but auth.json has a known OAuth credential,
-       set model.provider + base_url so the agent can find credentials.
+    1. For an explicit OAuth shortcut, select that authenticated provider as the
+       active model provider (and its subscription default). Otherwise, fill a
+       missing model.provider from auth.json without overriding user selection.
     2. Backfill stale `model: <other-provider>/<x>` and missing model_provider on
        webui sessions (and the _index.json cache).
     3. Delete the catalog cache file so the next webui process rebuilds fresh.
@@ -177,18 +179,45 @@ def _post_auth_heal_and_restart() -> str:
                 model_cfg = cfg.get("model")
                 if not isinstance(model_cfg, dict):
                     model_cfg = {}
-                if not model_cfg.get("provider"):
+                explicit_provider = provider_hint if provider_hint in authed else None
+                previous_provider = model_cfg.get("provider")
+                changed = False
+
+                if explicit_provider:
+                    # Clicking an OAuth shortcut is an explicit provider choice.
+                    # Do not leave an older API-key provider active after Codex login.
+                    chosen_provider = explicit_provider
+                    if model_cfg.get("provider") != chosen_provider:
+                        model_cfg["provider"] = chosen_provider
+                        model_cfg["default"] = _PROVIDER_DEFAULT_MODEL[chosen_provider]
+                        changed = True
+                    if model_cfg.get("base_url") != _PROVIDER_BASE[chosen_provider]:
+                        model_cfg["base_url"] = _PROVIDER_BASE[chosen_provider]
+                        changed = True
+                    if not model_cfg.get("default") and chosen_provider in _PROVIDER_DEFAULT_MODEL:
+                        model_cfg["default"] = _PROVIDER_DEFAULT_MODEL[chosen_provider]
+                        changed = True
+                elif not model_cfg.get("provider"):
                     chosen_provider = authed[0]
                     model_cfg["provider"] = chosen_provider
                     if not model_cfg.get("base_url"):
                         model_cfg["base_url"] = _PROVIDER_BASE[chosen_provider]
                     if not model_cfg.get("default") and chosen_provider in _PROVIDER_DEFAULT_MODEL:
                         model_cfg["default"] = _PROVIDER_DEFAULT_MODEL[chosen_provider]
-                    cfg["model"] = model_cfg
-                    yaml.safe_dump(cfg, cfg_p.open("w", encoding="utf-8"), sort_keys=False)
-                    notes.append(f"wrote config.yaml: model.provider={chosen_provider}, default={model_cfg.get('default')!r}")
+                    changed = True
                 else:
                     chosen_provider = model_cfg["provider"]
+
+                if changed:
+                    cfg["model"] = model_cfg
+                    yaml.safe_dump(cfg, cfg_p.open("w", encoding="utf-8"), sort_keys=False)
+                    notes.append(
+                        f"selected OAuth provider={chosen_provider}, default={model_cfg.get('default')!r}"
+                        if explicit_provider
+                        else f"wrote config.yaml: model.provider={chosen_provider}, default={model_cfg.get('default')!r}"
+                    )
+                elif explicit_provider and previous_provider == chosen_provider:
+                    notes.append(f"OAuth provider already active: {chosen_provider}")
         except Exception as exc:
             notes.append(f"config heal failed: {exc!r}")
 
@@ -288,7 +317,13 @@ def _post_auth_heal_and_restart() -> str:
     return "; ".join(notes) if notes else "no-op (nothing to heal)"
 
 
-async def _bridge(ws: WebSocket, argv: list[str], *, run_heal_on_success: bool) -> None:
+async def _bridge(
+    ws: WebSocket,
+    argv: list[str],
+    *,
+    run_heal_on_success: bool,
+    provider_hint: str | None = None,
+) -> None:
     from ptyprocess import PtyProcessUnicode  # type: ignore
 
     cwd = str(HERMES_HOME)
@@ -389,7 +424,7 @@ async def _bridge(ws: WebSocket, argv: list[str], *, run_heal_on_success: bool) 
         if run_heal_on_success and exit_code == 0:
             try:
                 heal_note = await asyncio.get_running_loop().run_in_executor(
-                    None, _post_auth_heal_and_restart
+                    None, _post_auth_heal_and_restart, provider_hint
                 )
             except Exception as exc:
                 heal_note = f"heal raised: {exc!r}"
