@@ -149,7 +149,7 @@ async def _ensure_session(client: httpx.AsyncClient, headers: dict[str, str]) ->
         json={
             "id": _SESSION_ID,
             "source": "api_server",
-            "title": "ChatGPT ↔ Railway Hermes",
+            "title": "ChatGPT to Railway Hermes",
             "system_prompt": _SYSTEM_MESSAGE,
         },
     )
