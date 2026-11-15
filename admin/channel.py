@@ -264,6 +264,10 @@ async def model_test(request: Request) -> JSONResponse:
     allowed_models = {"glm-5.3-flash-uncensored", "deepseek-v4.1-flash-uncensored"}
     if model not in allowed_models:
         return _error("Model is not in the isolated test allowlist", 400)
+    test_kind = payload.get("test_kind", "terminal")
+    allowed_kinds = {"terminal", "file", "browser", "web", "connections", "bridge"}
+    if test_kind not in allowed_kinds:
+        return _error("test_kind is not in the isolated test allowlist", 400)
     test_id = payload.get("test_id") or ("test-" + os.urandom(8).hex())
     if not isinstance(test_id, str) or not _REQUEST_ID_RE.fullmatch(test_id):
         return _error("test_id must contain 1-128 safe characters", 400)
@@ -272,15 +276,41 @@ async def model_test(request: Request) -> JSONResponse:
     if not api_key:
         return _error("Hermes API server key is not configured", 503)
     headers = {"Authorization": f"Bearer {api_key}"}
-    test_prompt = (
-        "Use your terminal tool exactly once to run Python that prints the literal "
-        "MODEL_TOOL_PASS. Do not run any other command and do not inspect files or "
-        "environment variables. After the tool returns, reply with only the captured "
-        "output string."
-    )
+    test_prompts = {
+        "terminal": (
+            "Use your terminal tool exactly once to run Python that prints the literal "
+            "MODEL_TOOL_PASS. Do not run any other command and do not inspect files or "
+            "environment variables. After the tool returns, reply with only the captured output."
+        ),
+        "file": (
+            f"Use your file tool to create /data/workspace/{test_id}.txt with exactly "
+            "FILE_TOOL_PASS, then read that same file back. Do not inspect any other file. "
+            "Reply with the exact readback."
+        ),
+        "browser": (
+            "Use the browser tool to open https://example.com. Return the page title and "
+            "final URL only. Do not click links or submit forms."
+        ),
+        "web": (
+            "Use the web_search tool to search for NousResearch Hermes Agent. Return the "
+            "top result title and URL only."
+        ),
+        "connections": (
+            "Use your connections tool to list existing connected integrations and their "
+            "authorization status. Do not start OAuth, connect, disconnect or change anything. "
+            "Return only connector names and statuses."
+        ),
+        "bridge": (
+            "Use the configured Personal Control Bridge MCP tools bridge_whoami and "
+            "bridge_health for read-only checks. Do not use terminal or any fallback. "
+            "Return the exact tool names and result statuses."
+        ),
+    }
+    test_prompt = test_prompts[test_kind]
     test_system = (
-        "This is an isolated model capability test. Use only the terminal tool for "
-        "the single harmless print operation requested. Do not inspect secrets or files."
+        "This is an isolated model capability test. Use only the specifically named tool "
+        "for this test. Do not inspect secrets, credentials, unrelated files or personal data. "
+        "Do not use another tool as a fallback."
     )
     try:
         timeout = httpx.Timeout(300.0, connect=5.0, read=300.0, write=20.0, pool=10.0)
@@ -319,7 +349,7 @@ async def model_test(request: Request) -> JSONResponse:
         runtime = result.get("usage", {}).get("runtime", {})
         return JSONResponse(
             {"ok": True, "test_id": test_id, "session_id": session_id,
-             "requested_model": model, "provider": "openai-api",
+             "requested_model": model, "provider": "openai-api", "test_kind": test_kind,
              "status": result.get("status"), "reply": content,
              "runtime": runtime, "usage": result.get("usage", {})},
             headers={"Cache-Control": "no-store"},
