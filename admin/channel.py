@@ -209,6 +209,39 @@ async def capabilities(request: Request) -> JSONResponse:
     except ValueError:
         return _error("Hermes capabilities response was invalid JSON", 502)
 
+
+async def _runtime_json(request: Request, path: str) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=3.0)) as client:
+            response = await client.get(
+                f"{_API_BASE}{path}",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if response.status_code != 200:
+            return _error(f"Hermes runtime endpoint returned HTTP {response.status_code}", 502)
+        return JSONResponse(response.json(), headers={"Cache-Control": "no-store"})
+    except httpx.HTTPError:
+        return _error("Hermes runtime endpoint is unavailable", 503)
+    except ValueError:
+        return _error("Hermes runtime response was invalid JSON", 502)
+
+
+async def toolsets(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/v1/toolsets")
+
+
+async def skills(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/v1/skills")
+
+
+async def models(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/v1/models")
+
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
