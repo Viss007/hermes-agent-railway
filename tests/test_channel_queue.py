@@ -75,6 +75,7 @@ def test_app_registers_outbox_and_worker_lifecycle():
     assert paths["/agent-channel/session"] == {"GET"}
     assert paths["/agent-channel/model-test"] == {"POST"}
     assert paths["/agent-channel/diagnostics"] == {"GET"}
+    assert paths["/agent-channel/configure-primary"] == {"POST"}
     assert paths["/agent-channel/outbox"] == {"GET", "POST"}
     assert paths["/agent-channel/outbox/{message_id}/ack"] == {"POST"}
     assert getattr(app.router.lifespan_context, "__name__", "") == "lifespan"

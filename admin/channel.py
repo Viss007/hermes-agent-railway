@@ -429,6 +429,67 @@ async def diagnostics(request: Request) -> JSONResponse:
         "channel": {"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
     }, headers={"Cache-Control": "no-store"})
 
+
+async def configure_primary(request: Request) -> JSONResponse:
+    """Apply the user's explicit primary-model and no-Desktop-Commander policy."""
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict) or payload != {"apply": True}:
+        return _error("This endpoint accepts only {apply:true}", 400)
+    home = Path(os.getenv("HERMES_HOME", "/data"))
+    config_path = home / "config.yaml"
+    backup_path = home / "config.yaml.pre-primary-agent.bak"
+    if not config_path.is_file():
+        return _error("Hermes config.yaml is missing", 404)
+    try:
+        import yaml
+        original = config_path.read_text()
+        cfg = yaml.safe_load(original) or {}
+        if not isinstance(cfg, dict):
+            return _error("Hermes config.yaml root is not a mapping", 500)
+        model_cfg = cfg.setdefault("model", {})
+        if not isinstance(model_cfg, dict):
+            return _error("Hermes model configuration is invalid", 500)
+        old_model = {"provider": model_cfg.get("provider"), "default": model_cfg.get("default")}
+        model_cfg["provider"] = "openai-api"
+        model_cfg["default"] = "deepseek-v4.1-flash-uncensored"
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+        if base_url:
+            model_cfg["base_url"] = base_url
+        mcp_cfg = cfg.get("mcp_servers")
+        disabled = []
+        if isinstance(mcp_cfg, dict):
+            dc = mcp_cfg.get("desktop-commander")
+            if isinstance(dc, dict):
+                dc["enabled"] = False
+                disabled.append("desktop-commander")
+        if not backup_path.exists():
+            backup_path.write_text(original)
+            os.chmod(backup_path, 0o600)
+        temp_path = config_path.with_name("config.yaml.primary-agent.tmp")
+        temp_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, config_path)
+        os.chmod(config_path, 0o600)
+        server_states = {}
+        if isinstance(mcp_cfg, dict):
+            for name, value in mcp_cfg.items():
+                server_states[name] = bool(value.get("enabled", True)) if isinstance(value, dict) else True
+        return JSONResponse({
+            "ok": True,
+            "backup": str(backup_path),
+            "previous_model": old_model,
+            "active_default_model": {"provider": model_cfg.get("provider"), "default": model_cfg.get("default")},
+            "disabled_mcp_servers": disabled,
+            "mcp_server_enabled": server_states,
+        }, headers={"Cache-Control": "no-store"})
+    except Exception:
+        return _error("Primary agent configuration update failed", 500)
+
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
