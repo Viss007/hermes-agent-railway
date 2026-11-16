@@ -57,6 +57,7 @@ routes = [
     Route("/agent-channel/session", chatgpt_channel.current_session, methods=["GET"]),
     Route("/agent-channel/model-test", chatgpt_channel.model_test, methods=["POST"]),
     Route("/agent-channel/diagnostics", chatgpt_channel.diagnostics, methods=["GET"]),
+    Route("/agent-channel/ui-audit", chatgpt_channel.ui_audit, methods=["GET"]),
     Route("/agent-channel/configure-primary", chatgpt_channel.configure_primary, methods=["POST"]),
     Route("/agent-channel/chat", chatgpt_channel.chat, methods=["POST"]),
     Route("/agent-channel/requests/{request_id}", chatgpt_channel.get_request, methods=["GET"]),

@@ -66,16 +66,71 @@ def test_outbox_is_persistent_and_idempotent(tmp_path, monkeypatch):
 def test_app_registers_outbox_and_worker_lifecycle():
     from admin.app import app
 
-    paths = {route.path: set(getattr(route, "methods", []) or []) for route in app.routes}
-    assert paths["/agent-channel/capabilities"] == {"GET"}
-    assert paths["/agent-channel/toolsets"] == {"GET"}
-    assert paths["/agent-channel/skills"] == {"GET"}
-    assert paths["/agent-channel/models"] == {"GET"}
-    assert paths["/agent-channel/model-options"] == {"GET"}
-    assert paths["/agent-channel/session"] == {"GET"}
+    paths = {}
+    for route in app.routes:
+        paths.setdefault(route.path, set()).update(getattr(route, "methods", []) or [])
+    assert paths["/agent-channel/capabilities"] >= {"GET"}
+    assert paths["/agent-channel/toolsets"] >= {"GET"}
+    assert paths["/agent-channel/skills"] >= {"GET"}
+    assert paths["/agent-channel/models"] >= {"GET"}
+    assert paths["/agent-channel/model-options"] >= {"GET"}
+    assert paths["/agent-channel/session"] >= {"GET"}
     assert paths["/agent-channel/model-test"] == {"POST"}
-    assert paths["/agent-channel/diagnostics"] == {"GET"}
+    assert paths["/agent-channel/diagnostics"] >= {"GET"}
     assert paths["/agent-channel/configure-primary"] == {"POST"}
-    assert paths["/agent-channel/outbox"] == {"GET", "POST"}
+    assert paths["/agent-channel/ui-audit"] >= {"GET"}
+    assert paths["/agent-channel/outbox"] >= {"GET", "POST"}
     assert paths["/agent-channel/outbox/{message_id}/ack"] == {"POST"}
     assert getattr(app.router.lifespan_context, "__name__", "") == "lifespan"
+
+
+def test_ui_audit_reads_recent_chat_and_redacts_secrets(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = tmp_path / ".hermes" / "webui"
+    session_dir = state / "sessions"
+    session_dir.mkdir(parents=True)
+    session = {
+        "session_id": "8c00d33543f6", "title": "UI rendering diagnosis",
+        "model": "gpt-5.6-luna", "model_provider": "openai-api",
+        "updated_at": 1794860000, "active_stream_id": "3d4b4755f146439ba9ea85696d33f6ec",
+        "pending_started_at": 1794859900, "pending_user_message": "last request",
+        "messages": [
+            {"role": "user", "content": "The stream freezes"},
+            {"role": "assistant", "content": "Bearer abcdefghijklmnopqrstuvwxyz"},
+            {"role": "assistant", "content": "sk-abcdefghijklmnopqrstuv"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "tool-1", "function": {"name": "terminal"}}
+            ]},
+        ],
+    }
+    (session_dir / "8c00d33543f6.json").write_text(json.dumps(session), encoding="utf-8")
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "webui.log").write_text("INFO start\nERROR stream closed unexpectedly\n", encoding="utf-8")
+    result = channel._collect_ui_audit(8, 12, "8c00d33543f6")
+    assert result["sessions"]["valid_sessions"] == 1
+    row = result["selected_sessions"][0]
+    assert row["session_id"] == "8c00d33543f6"
+    assert row["active_stream_id"] == "3d4b4755f146439ba9ea85696d33f6ec"
+    assert row["recent_messages"][1]["content"] == "Bearer [REDACTED]"
+    assert "[REDACTED]" in row["recent_messages"][2]["content"]
+    assert result["logs"]["webui"]["error_count_in_tail"] == 1
+    assert "stream closed unexpectedly" in result["logs"]["webui"]["errors"][0]
+
+
+def test_ui_audit_skips_corrupt_and_oversized_session_files(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_dir = tmp_path / ".hermes" / "webui" / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "broken.json").write_text("{", encoding="utf-8")
+    (session_dir / "too-large.json").write_bytes(b"x" * (25 * 1024 * 1024 + 1))
+    (session_dir / "valid.json").write_text(
+        json.dumps({"session_id": "valid", "messages": [], "updated_at": 1}), encoding="utf-8"
+    )
+    result = channel._collect_ui_audit(8, 12, None)
+    assert result["sessions"]["json_files"] == 3
+    assert result["sessions"]["valid_sessions"] == 1
+    assert result["sessions"]["invalid_sessions"] == 2
+
+

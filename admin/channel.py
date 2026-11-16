@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import shutil
 import time
 from pathlib import Path
 
@@ -161,6 +162,247 @@ async def _ensure_session(client: httpx.AsyncClient, headers: dict[str, str]) ->
         if retry.status_code == 200:
             return
     raise RuntimeError(f"Hermes session creation returned HTTP {created.status_code}")
+
+
+
+
+_AUDIT_SECRET_PATTERNS = (
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]{12,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{25,}\b"),
+)
+
+
+def _audit_redact(value: str, limit: int = 1400) -> str:
+    text = str(value)
+    for pattern in _AUDIT_SECRET_PATTERNS:
+        text = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", text)
+    text = re.sub(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password)(\s*[=:]\s*)\S+",
+                  r"\1\2[REDACTED]", text)
+    return text[:limit]
+
+
+def _audit_content(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _audit_redact(value)
+    if isinstance(value, list):
+        pieces = []
+        for part in value[:40]:
+            if isinstance(part, str):
+                pieces.append(part)
+            elif isinstance(part, dict):
+                kind = str(part.get("type") or "")
+                if isinstance(part.get("text"), str):
+                    pieces.append(part["text"])
+                elif kind in ("image", "image_url", "input_image"):
+                    pieces.append("[image attachment]")
+                elif kind in ("file", "input_file"):
+                    pieces.append("[file attachment]")
+        return _audit_redact("\n".join(pieces))
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return _audit_redact(value["text"])
+        return _audit_redact(json.dumps(value, ensure_ascii=False, default=str))
+    return _audit_redact(str(value))
+
+
+def _audit_message(message: dict) -> dict:
+    role = str(message.get("role") or message.get("type") or "unknown")[:40]
+    item = {
+        "role": role,
+        "content": _audit_content(message.get("content") or message.get("text")),
+    }
+    for key in ("timestamp", "created_at", "name", "tool_call_id", "tool_use_id", "stop_reason"):
+        value = message.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            item[key] = value
+    calls = message.get("tool_calls")
+    if isinstance(calls, list):
+        item["tool_calls"] = []
+        for call in calls[:12]:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            item["tool_calls"].append({
+                "id": _audit_redact(str(call.get("id") or call.get("tool_call_id") or ""), 100),
+                "name": _audit_redact(str(fn.get("name") or call.get("name") or ""), 100),
+                "arguments": _audit_content(fn.get("arguments") or call.get("arguments") or "")[:700],
+            })
+    return item
+
+
+def _audit_pid(pid_file: Path) -> dict:
+    result = {"pid_file": str(pid_file), "pid": None, "running": False, "state": None, "rss_kb": None}
+    try:
+        pid = int(pid_file.read_text().strip())
+        result["pid"] = pid
+        proc = Path("/proc") / str(pid)
+        result["running"] = proc.exists()
+        status = (proc / "status").read_text(errors="replace")
+        for line in status.splitlines():
+            if line.startswith("State:"):
+                result["state"] = line.split(":", 1)[1].strip()
+            elif line.startswith("VmRSS:"):
+                result["rss_kb"] = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
+def _collect_ui_audit(session_limit: int, message_limit: int, focus_sid: str | None) -> dict:
+    home = Path(os.getenv("HERMES_HOME", "/data"))
+    state_dir = Path(os.getenv("HERMES_WEBUI_STATE_DIR", str(home / ".hermes" / "webui")))
+    session_dir = state_dir / "sessions"
+    sessions = []
+    invalid_sessions = 0
+    if session_dir.is_dir():
+        paths = [p for p in session_dir.glob("*.json") if not p.name.startswith("_") and not p.is_symlink()]
+        paths.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        candidates = paths[:max(20, session_limit * 3)]
+        if focus_sid:
+            focus_path = session_dir / (focus_sid + ".json")
+            if focus_path.is_file() and not focus_path.is_symlink() and focus_path not in candidates:
+                candidates.insert(0, focus_path)
+        for path in candidates:
+            try:
+                if path.stat().st_size > 25 * 1024 * 1024:
+                    invalid_sessions += 1
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                invalid_sessions += 1
+                continue
+            if not isinstance(payload, dict):
+                invalid_sessions += 1
+                continue
+            sid = str(payload.get("session_id") or path.stem)
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", sid):
+                continue
+            messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+            try:
+                updated = float(payload.get("updated_at") or payload.get("last_message_at") or payload.get("created_at") or path.stat().st_mtime)
+            except (TypeError, ValueError, OSError):
+                updated = path.stat().st_mtime
+            summary = {
+                "session_id": sid,
+                "title": _audit_redact(str(payload.get("title") or "(untitled)"), 160),
+                "model": _audit_redact(str(payload.get("model") or ""), 120),
+                "model_provider": _audit_redact(str(payload.get("model_provider") or ""), 80),
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+                "last_message_at": payload.get("last_message_at"),
+                "message_count": int(payload.get("message_count") or len(messages) or 0),
+                "active_stream_id": payload.get("active_stream_id"),
+                "pending_started_at": payload.get("pending_started_at"),
+                "pending_user_message": bool(payload.get("pending_user_message")),
+                "input_tokens": payload.get("input_tokens"),
+                "output_tokens": payload.get("output_tokens"),
+                "estimated_cost": payload.get("estimated_cost"),
+                "context_length": payload.get("context_length"),
+                "_sort": updated,
+                "_messages": messages,
+            }
+            sessions.append(summary)
+    sessions.sort(key=lambda x: x["_sort"], reverse=True)
+    chosen = []
+    selected_ids = []
+    if focus_sid and any(x["session_id"] == focus_sid for x in sessions):
+        chosen.append(next(x for x in sessions if x["session_id"] == focus_sid))
+        selected_ids.append(focus_sid)
+    for row in sessions:
+        if row["session_id"] in selected_ids:
+            continue
+        if len(chosen) >= session_limit:
+            break
+        chosen.append(row)
+        selected_ids.append(row["session_id"])
+    out_sessions = []
+    for row in chosen:
+        messages = row.pop("_messages")
+        row.pop("_sort", None)
+        row["recent_messages"] = [_audit_message(m) for m in messages[-message_limit:] if isinstance(m, dict)]
+        out_sessions.append(row)
+    def log_report(path: Path, max_lines: int = 500) -> dict:
+        if not path.is_file() or path.is_symlink():
+            return {"path": str(path), "exists": False, "bytes": 0, "error_count": 0, "errors": []}
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                handle.seek(max(0, size - 1024 * 1024))
+                raw_lines = handle.read(1024 * 1024).decode("utf-8", "replace").splitlines()
+            tail = raw_lines[-max_lines:]
+            relevant = [line for line in tail if re.search(
+                r"(?i)\b(error|exception|traceback|timeout|timed out|cancel|cancelled|killed|oom|429|500|502|503|unauthorized|failed|restart)\b",
+                line,
+            )]
+            return {
+                "path": str(path), "exists": True, "bytes": size,
+                "lines_read": len(tail), "tail_bytes_read": min(size, 1024 * 1024),
+                "error_count_in_tail": sum(1 for line in tail if re.search(r"(?i)\b(error|exception|traceback|timeout|oom|failed)\b", line)),
+                "errors": [_audit_redact(line, 1200) for line in relevant[-60:]],
+            }
+        except OSError as exc:
+            return {"path": str(path), "exists": True, "error": type(exc).__name__}
+    try:
+        usage = shutil.disk_usage(home)
+        disk = {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free,
+                "used_percent": round(100 * usage.used / usage.total, 2) if usage.total else None}
+    except OSError:
+        disk = {}
+    mem = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith(("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:")):
+                k, v = line.split(":", 1)
+                mem[k] = int(v.strip().split()[0])
+    except OSError:
+        pass
+    sessions_meta = {
+        "session_dir": str(session_dir),
+        "exists": session_dir.is_dir(),
+        "json_files": len(paths) if session_dir.is_dir() else 0,
+        "valid_sessions": len(sessions),
+        "invalid_sessions": invalid_sessions,
+    }
+    return {
+        "ok": True,
+        "scope": "read-only-webui-audit",
+        "state_dir": str(state_dir),
+        "sessions": sessions_meta,
+        "selected_sessions": out_sessions,
+        "processes": {
+            "webui": _audit_pid(state_dir / "server.pid"),
+            "gateway": _audit_pid(home / "gateway.pid"),
+        },
+        "memory_kb": mem,
+        "disk": disk,
+        "logs": {
+            "webui": log_report(home / "logs" / "webui.log"),
+            "gateway": log_report(home / "logs" / "gateway.log"),
+        },
+        "client_event_log": log_report(state_dir / "client-events.log"),
+    }
+
+
+async def ui_audit(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        session_limit = max(1, min(20, int(request.query_params.get("sessions", "8"))))
+        message_limit = max(1, min(30, int(request.query_params.get("messages", "12"))))
+    except ValueError:
+        return _error("sessions/messages must be integers", 400)
+    focus_sid = request.query_params.get("session_id")
+    if focus_sid and not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", focus_sid):
+        return _error("Invalid session_id", 400)
+    try:
+        result = await asyncio.to_thread(_collect_ui_audit, session_limit, message_limit, focus_sid)
+    except Exception:
+        return _error("Read-only UI audit failed", 500)
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 async def health(request: Request) -> JSONResponse:
