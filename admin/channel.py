@@ -380,6 +380,8 @@ def _collect_ui_audit(session_limit: int, message_limit: int, focus_sid: str | N
         "memory_kb": mem,
         "disk": disk,
         "logs": {
+            "agent": log_report(home / "logs" / "agent.log"),
+            "errors": log_report(home / "logs" / "errors.log"),
             "webui": log_report(home / "logs" / "webui.log"),
             "gateway": log_report(home / "logs" / "gateway.log"),
         },

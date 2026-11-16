@@ -116,6 +116,8 @@ def test_ui_audit_reads_recent_chat_and_redacts_secrets(tmp_path, monkeypatch):
     assert "[REDACTED]" in row["recent_messages"][2]["content"]
     assert result["logs"]["webui"]["error_count_in_tail"] == 1
     assert "stream closed unexpectedly" in result["logs"]["webui"]["errors"][0]
+    assert "agent" in result["logs"]
+    assert "errors" in result["logs"]
 
 
 def test_ui_audit_skips_corrupt_and_oversized_session_files(tmp_path, monkeypatch):
