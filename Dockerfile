@@ -92,6 +92,11 @@ USER hermes
 RUN uv venv && \
     uv pip install --no-cache-dir -e ".[all,messaging]"
 
+# Install WhatsApp bridge dependencies before the one-shot pairing process runs.
+RUN cd /opt/hermes/scripts/whatsapp-bridge && \
+    npm install --silent && \
+    printf "%s" "85756e3e1c0418df" > node_modules/.hermes-pkg-hash
+
 # Hermes WebUI: pure Python (stdlib + pyyaml) + vanilla JS, served from /opt/hermes-webui
 WORKDIR /opt/hermes-webui
 
@@ -119,14 +124,12 @@ COPY --chown=hermes:hermes skills ./skills
 COPY --chown=hermes:hermes profile ./profile
 COPY --chown=hermes:hermes patches ./patches
 COPY --chown=hermes:hermes entrypoint.sh ./entrypoint.sh
-COPY --chown=hermes:hermes patches/whatsapp-bridge.js /opt/hermes/scripts/whatsapp-bridge/bridge.js
 
 RUN sed -i 's/\r$//' /opt/hermes-railway/entrypoint.sh && \
     chmod +x /opt/hermes-railway/entrypoint.sh && \
     git config --system --add safe.directory /opt/hermes && \
     git config --system --add safe.directory /opt/hermes-webui && \
     gosu hermes python3 /opt/hermes-railway/patches/patch_webui_sse.py /opt/hermes-webui/static/messages.js && \
-    gosu hermes node --check /opt/hermes/scripts/whatsapp-bridge/bridge.js && \
     gosu hermes node --check /opt/hermes-webui/static/messages.js
 
 EXPOSE 8080
