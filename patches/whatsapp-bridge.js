@@ -125,6 +125,7 @@ const PAIR_ONLY = args.includes('--pair-only');
 const PASSKEY_REQUIRED_EXIT = 78;
 const PAIR_JSON = args.includes('--pair-json');
 const PAIRING_PHONE_NUMBER = String(process.env.WHATSAPP_PAIRING_PHONE_NUMBER || '').replace(/\D/g, '');
+if (PAIR_JSON) console.log(`[whatsapp-pairing] Phone-number mode configured: ${PAIRING_PHONE_NUMBER.length > 0}`);
 const PASSKEY_BROWSER = getArg('passkey-browser', '');
 let passkeySigner;
 try {
@@ -477,9 +478,11 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      if (PAIRING_PHONE_NUMBER && !state.creds.registered) {
+      if (PAIRING_PHONE_NUMBER) {
         if (!pairingCodeRequested) {
           pairingCodeRequested = true;
+          emitPairEvent({ event: 'pairing_code_request_started' });
+          console.log('[whatsapp-pairing] Requesting phone-number linking code.');
           sock.requestPairingCode(PAIRING_PHONE_NUMBER).then((code) => {
             emitPairEvent({ event: 'pairing_code', code, valid_for_seconds: 180 });
             console.log('[whatsapp-pairing] Pairing code generated (expires in about 180 seconds).');
@@ -1220,7 +1223,7 @@ app.get('/health', (req, res) => {
 if (PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
   if (PAIR_JSON) {
-    emitPairEvent({ event: 'started', session: SESSION_DIR });
+    emitPairEvent({ event: 'started', session: SESSION_DIR, phone_pairing_enabled: Boolean(PAIRING_PHONE_NUMBER) });
   } else {
     console.log('📱 WhatsApp pairing mode');
     console.log(`📁 Session: ${SESSION_DIR}`);
