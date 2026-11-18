@@ -359,17 +359,57 @@ export HERMES_WEBUI_AGENT_DIR="/opt/hermes"
 if [ "${START_GATEWAY:-false}" = "true" ]; then
   GATEWAY_LOG="${HERMES_HOME}/logs/gateway.log"
   GATEWAY_PID_FILE="${HERMES_HOME}/gateway.pid"
-  echo "Starting Hermes messaging gateway in background..."
-  printf '\n--- Starting Hermes gateway %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
-  if [ "$(id -u)" = "0" ]; then
-    setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
-      >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+  WHATSAPP_SESSION_DIR="${HERMES_HOME}/platforms/whatsapp/session"
+  PAIRING_PHONE="${WHATSAPP_PAIRING_PHONE_NUMBER:-}"
+  if [ -n "${PAIRING_PHONE}" ] && [ ! -s "${WHATSAPP_SESSION_DIR}/creds.json" ]; then
+    echo "Starting one-shot WhatsApp phone-number pairing before the gateway..."
+    mkdir -p "${WHATSAPP_SESSION_DIR}"
+    if [ "$(id -u)" = "0" ]; then
+      chown hermes:hermes "${WHATSAPP_SESSION_DIR}"
+    fi
+    (
+      set +e
+      if [ "$(id -u)" = "0" ]; then
+        gosu hermes env WHATSAPP_PAIRING_PHONE_NUMBER="${PAIRING_PHONE}" node \
+          /opt/hermes/scripts/whatsapp-bridge/bridge.js --pair-only --pair-json \
+          --session "${WHATSAPP_SESSION_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
+        PAIR_RC=$?
+      else
+        WHATSAPP_PAIRING_PHONE_NUMBER="${PAIRING_PHONE}" node \
+          /opt/hermes/scripts/whatsapp-bridge/bridge.js --pair-only --pair-json \
+          --session "${WHATSAPP_SESSION_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
+        PAIR_RC=$?
+      fi
+      if [ -s "${WHATSAPP_SESSION_DIR}/creds.json" ]; then
+        echo "WhatsApp credentials saved; starting Hermes gateway."
+        printf '\n--- Starting Hermes gateway after WhatsApp pairing %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
+        if [ "$(id -u)" = "0" ]; then
+          setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
+            >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+        else
+          setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
+            >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+        fi
+        GW_PID=$!
+        echo "${GW_PID}" > "${GATEWAY_PID_FILE}"
+        wait "${GW_PID}"
+      else
+        echo "WhatsApp pairing process ended without saved credentials (exit ${PAIR_RC}); gateway was not started."
+      fi
+    ) &
   else
-    setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
-      >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    echo "Starting Hermes messaging gateway in background..."
+    printf '\n--- Starting Hermes gateway %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
+    if [ "$(id -u)" = "0" ]; then
+      setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
+        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    else
+      setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
+        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    fi
+    echo $! > "${GATEWAY_PID_FILE}"
+    echo "Gateway PID: $(cat "${GATEWAY_PID_FILE}") (logs at ${GATEWAY_LOG})"
   fi
-  echo $! > "${GATEWAY_PID_FILE}"
-  echo "Gateway PID: $(cat "${GATEWAY_PID_FILE}") (logs at ${GATEWAY_LOG})"
 fi
 
 WEBUI_LOG="${HERMES_HOME}/logs/webui.log"
