@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -417,7 +417,7 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
-const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+const getWAVersion = createVersionResolver(fetchLatestWaWebVersion);
 
 async function confirmPasskeyCode(code, signal) {
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
@@ -432,13 +432,20 @@ async function confirmPasskeyCode(code, signal) {
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const version = await getWAVersion();
+  if (PAIR_ONLY && !version) {
+    emitPairEvent({ event: 'error', error: 'live_whatsapp_version_unavailable' });
+    console.error('[whatsapp-pairing] Live WhatsApp Web revision unavailable; refusing to issue a pairing code using the stale bundled revision.');
+    process.exit(1);
+    return;
+  }
+  if (version) console.log(`[whatsapp-pairing] Using live WhatsApp Web revision ${version.join('.')}.`);
 
   sock = makeWASocket({
     ...(version ? { version } : {}),
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
+    browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
