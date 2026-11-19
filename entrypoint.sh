@@ -360,28 +360,40 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
   GATEWAY_LOG="${HERMES_HOME}/logs/gateway.log"
   GATEWAY_PID_FILE="${HERMES_HOME}/gateway.pid"
   WHATSAPP_SESSION_DIR="${HERMES_HOME}/platforms/whatsapp/session"
+  PAIRING_STATE_DIR="${HERMES_HOME}/platforms/whatsapp/pairing-session"
+  PAIRING_COMPLETE_FILE="${HERMES_HOME}/platforms/whatsapp/.phone-pairing-complete"
   PAIRING_PHONE="${WHATSAPP_PAIRING_PHONE_NUMBER:-}"
-  if [ -n "${PAIRING_PHONE}" ]; then
-    echo "Starting one-shot WhatsApp phone-number pairing before the gateway..."
-    mkdir -p "${WHATSAPP_SESSION_DIR}"
+  if [ -n "${PAIRING_PHONE}" ] && [ ! -f "${PAIRING_COMPLETE_FILE}" ]; then
+    echo "Starting fresh WhatsApp phone-number pairing in isolated session state..."
+    mkdir -p "$(dirname "${WHATSAPP_SESSION_DIR}")"
+    rm -rf "${PAIRING_STATE_DIR}"
+    mkdir -p "${PAIRING_STATE_DIR}"
     if [ "$(id -u)" = "0" ]; then
-      chown hermes:hermes "${WHATSAPP_SESSION_DIR}"
+      chown hermes:hermes "${PAIRING_STATE_DIR}"
     fi
     (
       set +e
       if [ "$(id -u)" = "0" ]; then
         gosu hermes env WHATSAPP_PAIRING_PHONE_NUMBER="${PAIRING_PHONE}" node \
           /opt/hermes/scripts/whatsapp-bridge/bridge.js --pair-only --pair-json \
-          --session "${WHATSAPP_SESSION_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
+          --session "${PAIRING_STATE_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
         PAIR_RC=$?
       else
         WHATSAPP_PAIRING_PHONE_NUMBER="${PAIRING_PHONE}" node \
           /opt/hermes/scripts/whatsapp-bridge/bridge.js --pair-only --pair-json \
-          --session "${WHATSAPP_SESSION_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
+          --session "${PAIRING_STATE_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
         PAIR_RC=$?
       fi
-      if [ -s "${WHATSAPP_SESSION_DIR}/creds.json" ]; then
-        echo "WhatsApp credentials saved; starting Hermes gateway."
+      if [ "${PAIR_RC}" -eq 0 ] && [ -s "${PAIRING_STATE_DIR}/creds.json" ]; then
+        if [ -d "${WHATSAPP_SESSION_DIR}" ]; then
+          mv "${WHATSAPP_SESSION_DIR}" "${WHATSAPP_SESSION_DIR}.pre-pair-backup-$(date +%s)"
+        fi
+        mv "${PAIRING_STATE_DIR}" "${WHATSAPP_SESSION_DIR}"
+        touch "${PAIRING_COMPLETE_FILE}"
+        if [ "$(id -u)" = "0" ]; then
+          chown -R hermes:hermes "${WHATSAPP_SESSION_DIR}" "${PAIRING_COMPLETE_FILE}"
+        fi
+        echo "WhatsApp phone pairing completed; authenticated session installed."
         printf '\n--- Starting Hermes gateway after WhatsApp pairing %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
         if [ "$(id -u)" = "0" ]; then
           setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
@@ -394,7 +406,7 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
         echo "${GW_PID}" > "${GATEWAY_PID_FILE}"
         wait "${GW_PID}"
       else
-        echo "WhatsApp pairing process ended without saved credentials (exit ${PAIR_RC}); gateway was not started."
+        echo "WhatsApp phone pairing is not complete (exit ${PAIR_RC}); gateway was not started."
       fi
     ) &
   else
