@@ -10,6 +10,7 @@ from contextlib import closing
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -37,9 +38,15 @@ _API_PORT = os.getenv("API_SERVER_PORT", "8642")
 _API_BASE = f"http://{_API_HOST}:{_API_PORT}"
 _LOCK = asyncio.Lock()
 _WORKER_TASK: asyncio.Task | None = None
+_WORKER_STOP_TIMEOUT = 5.0
 _WAKE_EVENT = asyncio.Event()
 _STOP_EVENT = asyncio.Event()
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_LOG = logging.getLogger(__name__)
+
+
+class _TransientApiError(RuntimeError):
+    """A temporary API status before the chat turn was submitted."""
 
 
 def _db_path() -> Path:
@@ -56,6 +63,8 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("BEGIN IMMEDIATE")
+    schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.execute(
         """CREATE TABLE IF NOT EXISTS requests (
             request_id TEXT PRIMARY KEY,
@@ -66,18 +75,44 @@ def _connect() -> sqlite3.Connection:
             session_id TEXT,
             message TEXT,
             created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            chat_submitted_at REAL
         )"""
     )
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
     if "message" not in columns:
         conn.execute("ALTER TABLE requests ADD COLUMN message TEXT")
+    if "attempts" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    if "next_attempt_at" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN next_attempt_at REAL")
+    if "chat_submitted_at" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN chat_submitted_at REAL")
+    if schema_version < 1:
+        # Legacy processing rows predate the durable submission marker. Treat
+        # them as possibly executed; never replay them during schema upgrade.
+        conn.execute(
+            "UPDATE requests SET chat_submitted_at=updated_at WHERE status='processing'"
+        )
+        conn.execute("PRAGMA user_version=1")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS outbox (
             message_id TEXT PRIMARY KEY,
             message TEXT NOT NULL,
             created_at REAL NOT NULL,
             acked_at REAL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS model_tests (
+            test_key TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            error TEXT
         )"""
     )
     conn.commit()
@@ -143,6 +178,8 @@ async def _ensure_session(client: httpx.AsyncClient, headers: dict[str, str]) ->
     if current.status_code == 200:
         return
     if current.status_code != 404:
+        if current.status_code == 429 or current.status_code >= 500:
+            raise _TransientApiError(f"Hermes session lookup returned HTTP {current.status_code}")
         raise RuntimeError(f"Hermes session lookup returned HTTP {current.status_code}")
     created = await client.post(
         f"{_API_BASE}/api/sessions",
@@ -156,11 +193,15 @@ async def _ensure_session(client: httpx.AsyncClient, headers: dict[str, str]) ->
     )
     if created.status_code in (200, 201):
         return
+    if created.status_code == 429 or created.status_code >= 500:
+        raise _TransientApiError(f"Hermes session creation returned HTTP {created.status_code}")
     # Concurrent first messages may race to create the same fixed session.
     if created.status_code == 409:
         retry = await client.get(url, headers=headers)
         if retry.status_code == 200:
             return
+        if retry.status_code == 429 or retry.status_code >= 500:
+            raise _TransientApiError(f"Hermes session verification returned HTTP {retry.status_code}")
     raise RuntimeError(f"Hermes session creation returned HTTP {created.status_code}")
 
 
@@ -494,13 +535,52 @@ async def current_session(request: Request) -> JSONResponse:
     return await _runtime_json(request, f"/api/sessions/{_SESSION_ID}")
 
 
+def _model_test_identity(test_id: str, model: str, test_kind: str) -> tuple[str, str]:
+    fingerprint = hashlib.sha256(
+        f"{test_id}\0{model}\0{test_kind}".encode("utf-8")
+    ).hexdigest()
+    return "model-test-" + fingerprint[:32], "model-test-" + fingerprint
+
+
+def _reserve_model_test(test_key: str, session_id: str) -> tuple[bool, dict | None]:
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO model_tests(test_key,session_id,status,created_at,updated_at) "
+            "VALUES(?,?,'running',?,?)",
+            (test_key, session_id, now, now),
+        )
+        if cur.rowcount == 1:
+            return True, None
+        row = conn.execute(
+            "SELECT test_key,session_id,status,created_at,updated_at,error "
+            "FROM model_tests WHERE test_key=?",
+            (test_key,),
+        ).fetchone()
+        return False, dict(row) if row is not None else None
+
+
+def _finish_model_test(test_key: str, status: str, error: str | None = None) -> None:
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE model_tests SET status=?,error=?,updated_at=? WHERE test_key=?",
+            (status, _audit_redact(error, 500) if error else None, time.time(), test_key),
+        )
+
+
 async def model_test(request: Request) -> JSONResponse:
     """Isolated, allowlisted tool-use test; never changes the primary session."""
     if not _authorized(request):
         return _error("Unauthorized", 401)
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 65536):
+        return _error("Request body too large", 413)
     try:
-        payload = await request.json()
-    except Exception:
+        raw = await request.body()
+        if len(raw) > 65536:
+            return _error("Request body too large", 413)
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return _error("Expected a JSON request body", 400)
     if not isinstance(payload, dict):
         return _error("Expected a JSON object", 400)
@@ -518,10 +598,17 @@ async def model_test(request: Request) -> JSONResponse:
     test_id = payload.get("test_id") or ("test-" + os.urandom(8).hex())
     if not isinstance(test_id, str) or not _REQUEST_ID_RE.fullmatch(test_id):
         return _error("test_id must contain 1-128 safe characters", 400)
-    session_id = "model-test-" + test_id[:90]
+    session_id, test_key = _model_test_identity(test_id, model, test_kind)
     api_key = os.getenv("API_SERVER_KEY", "")
     if not api_key:
         return _error("Hermes API server key is not configured", 503)
+    reserved, previous_test = await asyncio.to_thread(_reserve_model_test, test_key, session_id)
+    if not reserved:
+        previous_status = previous_test.get("status", "unknown") if previous_test else "unknown"
+        return _error(
+            f"This model test ID was already used (status={previous_status}); choose a new test_id",
+            409,
+        )
     headers = {"Authorization": f"Bearer {api_key}"}
     test_prompts = {
         "terminal": (
@@ -592,6 +679,10 @@ async def model_test(request: Request) -> JSONResponse:
                     return _error(
                         f"Test session creation returned HTTP {created.status_code}: {detail}", 502
                     )
+                if created.status_code == 409:
+                    verify = await client.get(f"{_API_BASE}/api/sessions/{session_id}", headers=headers)
+                    if verify.status_code != 200:
+                        return _error("Test session already existed but could not be verified", 502)
             elif current.status_code != 200:
                 return _error(f"Test session lookup returned HTTP {current.status_code}", 502)
             locked = await client.post(
@@ -604,7 +695,7 @@ async def model_test(request: Request) -> JSONResponse:
                 return _error(f"Model lock failed HTTP {locked.status_code}: {detail}", 502)
             response = await client.post(
                 f"{_API_BASE}/api/sessions/{session_id}/chat",
-                headers={**headers, "Idempotency-Key": test_id},
+                headers=headers,
                 json={"message": test_prompt, "system_message": test_system},
             )
         if response.status_code != 200:
@@ -613,6 +704,7 @@ async def model_test(request: Request) -> JSONResponse:
         result = response.json()
         content = result.get("message", {}).get("content", "")
         runtime = result.get("usage", {}).get("runtime", {})
+        await asyncio.to_thread(_finish_model_test, test_key, "completed")
         return JSONResponse(
             {"ok": True, "test_id": test_id, "session_id": session_id,
              "requested_model": model, "provider": "openai-api", "test_kind": test_kind,
@@ -760,30 +852,109 @@ async def configure_primary(request: Request) -> JSONResponse:
 def _claim_next() -> tuple[str, str] | None:
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        now = time.time()
         row = conn.execute(
             "SELECT request_id, message FROM requests WHERE status = 'queued' "
-            "ORDER BY created_at LIMIT 1"
+            "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+            "ORDER BY created_at LIMIT 1",
+            (now,),
         ).fetchone()
         if row is None:
             conn.commit()
             return None
         conn.execute(
-            "UPDATE requests SET status='processing', error=NULL, updated_at=? "
+            "UPDATE requests SET status='processing', error=NULL, attempts=attempts+1, "
+            "next_attempt_at=NULL, chat_submitted_at=NULL, updated_at=? "
             "WHERE request_id=? AND status='queued'",
-            (time.time(), row["request_id"]),
+            (now, row["request_id"]),
         )
         conn.commit()
         return row["request_id"], row["message"] or ""
 
 
-def _mark_stale_uncertain() -> None:
-    cutoff = time.time() - 1200
+def _release_unsubmitted(request_id: str, error: str) -> None:
+    """Return work to the queue on shutdown when no chat turn was submitted."""
     with closing(_connect()) as conn, conn:
         conn.execute(
+            "UPDATE requests SET status='queued', attempts=MAX(attempts-1, 0), "
+            "next_attempt_at=NULL, chat_submitted_at=NULL, error=?, updated_at=? "
+            "WHERE request_id=? AND status='processing'",
+            (_audit_redact(error, 500), time.time(), request_id),
+        )
+
+
+def _retryable_admission_refusal(response: httpx.Response) -> bool:
+    """Recognize upstream replies that explicitly refuse work before execution."""
+    if response.status_code == 429:
+        return True
+    if response.status_code != 503:
+        return False
+    try:
+        payload = response.json()
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return isinstance(error, dict) and error.get("code") == "gateway_draining"
+    except (ValueError, AttributeError):
+        return False
+
+
+def _retry_before_submission(request_id: str, error: str, max_attempts: int = 4) -> bool:
+    """Retry transient failures only while no Hermes chat turn was submitted."""
+    now = time.time()
+    safe_error = _audit_redact(" ".join(str(error).split()), 500)
+    with closing(_connect()) as conn, conn:
+        row = conn.execute(
+            "SELECT attempts FROM requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        attempts = int(row["attempts"] or 0) if row is not None else max_attempts
+        if row is not None and attempts < max_attempts:
+            delay = min(2 ** attempts, 15)
+            conn.execute(
+                "UPDATE requests SET status='queued', error=?, next_attempt_at=?, "
+                "chat_submitted_at=NULL, updated_at=? "
+                "WHERE request_id=? AND status='processing'",
+                (f"Temporary Hermes API failure; retry {attempts}/{max_attempts} in {delay}s: {safe_error}",
+                 now + delay, now, request_id),
+            )
+            return True
+        conn.execute(
+            "UPDATE requests SET status='failed', error=?, next_attempt_at=NULL, updated_at=? "
+            "WHERE request_id=? AND status='processing'",
+            (f"Hermes API unavailable after {attempts} attempts: {safe_error}", now, request_id),
+        )
+        return False
+
+
+def _mark_chat_submitted(request_id: str) -> None:
+    """Persist the no-replay boundary before sending a chat turn to Hermes."""
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute(
+            "UPDATE requests SET chat_submitted_at=?, updated_at=? "
+            "WHERE request_id=? AND status='processing'",
+            (now, now, request_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not confirm durable submission marker; chat was not sent")
+
+
+def _mark_stale_uncertain() -> None:
+    """Recover abandoned work without replaying a possibly executed chat turn."""
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        # If the durable boundary was crossed, Hermes may already have executed it.
+        conn.execute(
             "UPDATE requests SET status='uncertain', "
-            "error='Worker stopped while request was processing; inspect Hermes session before retrying', "
-            "updated_at=? WHERE status='processing' AND updated_at < ?",
-            (time.time(), cutoff),
+            "error='Previous worker stopped after chat submission; inspect Hermes session before retrying', "
+            "updated_at=? WHERE status='processing' AND chat_submitted_at IS NOT NULL",
+            (now,),
+        )
+        # Work that stopped before the chat POST is safe to return to the queue.
+        conn.execute(
+            "UPDATE requests SET status='queued', attempts=MAX(attempts-1, 0), "
+            "error='Previous worker stopped before chat submission; safely requeued', "
+            "next_attempt_at=NULL, updated_at=? "
+            "WHERE status='processing' AND chat_submitted_at IS NULL",
+            (now,),
         )
 
 
@@ -792,6 +963,7 @@ async def _execute_request(request_id: str, message: str) -> None:
     if not api_key:
         await asyncio.to_thread(_finish, request_id, "failed", error="API server key missing")
         return
+    chat_submitted = False
     async with _LOCK:
         try:
             api_headers = {"Authorization": f"Bearer {api_key}"}
@@ -804,29 +976,52 @@ async def _execute_request(request_id: str, message: str) -> None:
                     json={"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
                 )
                 if model_lock.status_code != 200:
-                    await asyncio.to_thread(
-                        _finish, request_id, "failed",
-                        error=f"Hermes model selection returned HTTP {model_lock.status_code}",
-                        session_id=_SESSION_ID,
-                    )
+                    if model_lock.status_code == 429 or model_lock.status_code >= 500:
+                        await asyncio.to_thread(
+                            _retry_before_submission, request_id,
+                            f"Hermes model selection returned HTTP {model_lock.status_code}",
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            _finish, request_id, "failed",
+                            error=f"Hermes model selection returned HTTP {model_lock.status_code}",
+                            session_id=_SESSION_ID,
+                        )
                     return
+                await asyncio.to_thread(_mark_chat_submitted, request_id)
+                chat_submitted = True
                 response = await client.post(
                     f"{_API_BASE}/api/sessions/{_SESSION_ID}/chat",
                     headers={**api_headers, "Idempotency-Key": request_id},
                     json={"message": message, "system_message": _SYSTEM_MESSAGE},
                 )
             if response.status_code != 200:
-                detail = " ".join((response.text or "").split())[:1200]
+                detail = _audit_redact(" ".join((response.text or "").split()), 800)
+                if _retryable_admission_refusal(response):
+                    await asyncio.to_thread(
+                        _retry_before_submission, request_id,
+                        f"Hermes API declined admission with HTTP {response.status_code}: {detail}",
+                    )
+                else:
+                    outcome = "uncertain" if response.status_code >= 500 else "failed"
+                    await asyncio.to_thread(
+                        _finish, request_id, outcome,
+                        error=f"Hermes API returned HTTP {response.status_code}: {detail}",
+                        session_id=_SESSION_ID,
+                    )
+                return
+            try:
+                result = response.json()
+            except ValueError:
                 await asyncio.to_thread(
-                    _finish, request_id, "failed",
-                    error=f"Hermes API returned HTTP {response.status_code}: {detail}",
+                    _finish, request_id, "uncertain",
+                    error="Hermes API returned unreadable JSON after accepting the chat request",
                     session_id=_SESSION_ID,
                 )
                 return
-            result = response.json()
             if not isinstance(result, dict):
                 raise RuntimeError(f"Unexpected Hermes API response type: {type(result).__name__}")
-            state = result.get("status", "completed")
+            state = result.get("status")
             message_obj = result.get("message", {})
             if isinstance(message_obj, dict):
                 content = message_obj.get("content", "")
@@ -837,44 +1032,95 @@ async def _execute_request(request_id: str, message: str) -> None:
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False)
             if state != "completed":
+                outcome = "failed" if state == "failed" else "uncertain"
                 await asyncio.to_thread(
-                    _finish, request_id, "failed", reply=content,
-                    error=f"Hermes turn finished with status {state}", session_id=_SESSION_ID,
+                    _finish, request_id, outcome, reply=content,
+                    error=f"Hermes turn did not confirm completion (status={state!r})",
+                    session_id=_SESSION_ID,
                 )
                 return
             await asyncio.to_thread(
                 _finish, request_id, "completed", reply=content, session_id=_SESSION_ID,
             )
+        except asyncio.CancelledError:
+            if chat_submitted:
+                await asyncio.shield(asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error="Relay worker stopped during execution; inspect Hermes session before retrying",
+                    session_id=_SESSION_ID,
+                ))
+            else:
+                await asyncio.shield(asyncio.to_thread(
+                    _release_unsubmitted, request_id,
+                    "Relay worker stopped before submitting the Hermes chat request",
+                ))
+            raise
+        except _TransientApiError as exc:
+            await asyncio.to_thread(_retry_before_submission, request_id, str(exc))
         except httpx.TimeoutException:
-            await asyncio.to_thread(
-                _finish, request_id, "uncertain",
-                error="Hermes API exceeded 900 seconds; inspect session history before retrying",
-                session_id=_SESSION_ID,
-            )
-        except httpx.HTTPError:
-            await asyncio.to_thread(
-                _finish, request_id, "failed", error="Could not reach the local Hermes API server",
-                session_id=_SESSION_ID,
-            )
+            if chat_submitted:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error="Hermes API exceeded 900 seconds; inspect session history before retrying",
+                    session_id=_SESSION_ID,
+                )
+            else:
+                await asyncio.to_thread(
+                    _retry_before_submission, request_id, "Hermes API timed out before chat submission"
+                )
+        except httpx.ConnectError as exc:
+            if chat_submitted:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error=f"Hermes API connection failed ({type(exc).__name__}); inspect session before retrying",
+                    session_id=_SESSION_ID,
+                )
+            else:
+                await asyncio.to_thread(
+                    _retry_before_submission, request_id, "Could not connect to the local Hermes API server"
+                )
+        except httpx.HTTPError as exc:
+            if chat_submitted:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error=f"Hermes API connection failed ({type(exc).__name__}); inspect session before retrying",
+                    session_id=_SESSION_ID,
+                )
+            else:
+                await asyncio.to_thread(
+                    _retry_before_submission, request_id,
+                    f"Local Hermes API failed before chat submission ({type(exc).__name__})",
+                )
         except Exception as exc:
             detail = " ".join(str(exc).split())[:400]
             detail = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._-]+", r"\1[redacted]", detail)
             detail = re.sub(r"(?i)(api[_-]?key[=: ]+)[^\s,;]+", r"\1[redacted]", detail)
+            outcome = "uncertain" if chat_submitted else "failed"
             await asyncio.to_thread(
-                _finish, request_id, "failed",
+                _finish, request_id, outcome,
                 error=f"Hermes relay worker failed: {type(exc).__name__}: {detail}",
                 session_id=_SESSION_ID,
             )
 
 
 async def _worker_loop() -> None:
-    await asyncio.to_thread(_mark_stale_uncertain)
+    try:
+        await asyncio.to_thread(_mark_stale_uncertain)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOG.exception("Hermes channel startup recovery failed; worker will keep retrying")
     while not _STOP_EVENT.is_set():
-        item = await asyncio.to_thread(_claim_next)
-        if item is not None:
-            request_id, message = item
-            await _execute_request(request_id, message)
-            continue
+        try:
+            item = await asyncio.to_thread(_claim_next)
+            if item is not None:
+                request_id, message = item
+                await _execute_request(request_id, message)
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOG.exception("Hermes channel queue read failed; worker remains alive")
         _WAKE_EVENT.clear()
         try:
             await asyncio.wait_for(_WAKE_EVENT.wait(), timeout=2.0)
@@ -883,9 +1129,13 @@ async def _worker_loop() -> None:
 
 
 async def start_worker() -> None:
-    global _WORKER_TASK
-    _STOP_EVENT.clear()
+    global _WORKER_TASK, _WAKE_EVENT, _STOP_EVENT, _LOCK
     if _WORKER_TASK is None or _WORKER_TASK.done():
+        # Synchronization objects belong to the active ASGI event loop.
+        # Recreate them so app restarts cannot reuse a closed loop.
+        _LOCK = asyncio.Lock()
+        _WAKE_EVENT = asyncio.Event()
+        _STOP_EVENT = asyncio.Event()
         _WORKER_TASK = asyncio.create_task(_worker_loop(), name="hermes-channel-worker")
 
 
@@ -894,11 +1144,26 @@ async def stop_worker() -> None:
     _STOP_EVENT.set()
     _WAKE_EVENT.set()
     if _WORKER_TASK is not None:
+        task = _WORKER_TASK
         try:
-            await asyncio.wait_for(_WORKER_TASK, timeout=5.0)
+            await asyncio.wait_for(task, timeout=_WORKER_STOP_TIMEOUT)
         except asyncio.TimeoutError:
-            _WORKER_TASK.cancel()
-        _WORKER_TASK = None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError:
+            # Do not swallow cancellation of the ASGI shutdown itself.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            # A worker cancelled by the shutdown timeout propagates cancellation
+            # through its active request after recording a safe receipt.
+            if not task.cancelled():
+                raise
+        finally:
+            if task.done() or task.cancelled():
+                _WORKER_TASK = None
 
 
 async def chat(request: Request) -> JSONResponse:
@@ -957,9 +1222,15 @@ async def chat(request: Request) -> JSONResponse:
 async def post_outbox(request: Request) -> JSONResponse:
     if not _authorized(request):
         return _error("Unauthorized", 401)
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 65536):
+        return _error("Request body too large", 413)
     try:
-        payload = await request.json()
-    except Exception:
+        raw = await request.body()
+        if len(raw) > 65536:
+            return _error("Request body too large", 413)
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return _error("Expected a JSON request body", 400)
     if not isinstance(payload, dict):
         return _error("Expected a JSON object", 400)
