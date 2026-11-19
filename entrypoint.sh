@@ -363,7 +363,27 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
   PAIRING_STATE_DIR="${HERMES_HOME}/platforms/whatsapp/pairing-session"
   PAIRING_COMPLETE_FILE="${HERMES_HOME}/platforms/whatsapp/.phone-pairing-complete"
   PAIRING_PHONE="${WHATSAPP_PAIRING_PHONE_NUMBER:-}"
+
+  start_hermes_gateway() {
+    printf '\n--- Starting Hermes gateway %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
+    if [ "$(id -u)" = "0" ]; then
+      setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
+        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    else
+      setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
+        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    fi
+    GW_PID=$!
+    echo "${GW_PID}" > "${GATEWAY_PID_FILE}"
+    echo "Gateway PID: ${GW_PID} (logs at ${GATEWAY_LOG})"
+  }
+
   if [ -n "${PAIRING_PHONE}" ] && [ ! -f "${PAIRING_COMPLETE_FILE}" ]; then
+    echo "Starting Hermes gateway before WhatsApp pairing; API/UI remain available while WhatsApp is unpaired."
+    # The gateway owns the local API server used by the WebUI's authenticated
+    # operator channel. Do not hold that server hostage to interactive pairing.
+    start_hermes_gateway
+
     echo "Starting fresh WhatsApp phone-number pairing in isolated session state..."
     mkdir -p "$(dirname "${WHATSAPP_SESSION_DIR}")"
     rm -rf "${PAIRING_STATE_DIR}"
@@ -394,33 +414,16 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
           chown -R hermes:hermes "${WHATSAPP_SESSION_DIR}" "${PAIRING_COMPLETE_FILE}"
         fi
         echo "WhatsApp phone pairing completed; authenticated session installed."
-        printf '\n--- Starting Hermes gateway after WhatsApp pairing %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
-        if [ "$(id -u)" = "0" ]; then
-          setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
-            >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
-        else
-          setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
-            >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
-        fi
-        GW_PID=$!
-        echo "${GW_PID}" > "${GATEWAY_PID_FILE}"
-        wait "${GW_PID}"
+        # Replace the degraded gateway so the WhatsApp adapter loads the new
+        # credentials. --replace handles the existing gateway process safely.
+        start_hermes_gateway
       else
-        echo "WhatsApp phone pairing is not complete (exit ${PAIR_RC}); gateway was not started."
+        echo "WhatsApp phone pairing is not complete (exit ${PAIR_RC}); gateway stays online in degraded mode so the API and UI remain available."
       fi
     ) &
   else
     echo "Starting Hermes messaging gateway in background..."
-    printf '\n--- Starting Hermes gateway %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
-    if [ "$(id -u)" = "0" ]; then
-      setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
-        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
-    else
-      setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
-        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
-    fi
-    echo $! > "${GATEWAY_PID_FILE}"
-    echo "Gateway PID: $(cat "${GATEWAY_PID_FILE}") (logs at ${GATEWAY_LOG})"
+    start_hermes_gateway
   fi
 fi
 
