@@ -117,21 +117,31 @@ def patch_messages_js(source: str) -> str:
         raise RuntimeError("Legacy single-reconnect flag remains after patch")
     return patched
 
-def apply_patch(path: Path) -> bool:
-    path = path.resolve(strict=True)
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError("WebUI messages.js must be a regular file")
-    original = path.read_text(encoding="utf-8")
-    patched = patch_messages_js(original)
-    if patched == original:
-        print("[webui-patch] already applied")
-        return False
+INDEX_BASE_MARKER = "RAILWAY_STATIC_INDEX_BASE_FIX_V1"
+INDEX_BASE_ANCHOR = "marker='/session/',i=path.indexOf(marker),p;"
+INDEX_BASE_REPLACEMENT = (
+    "marker='/session/',i=path.indexOf(marker),p;"
+    "/* RAILWAY_STATIC_INDEX_BASE_FIX_V1: /static/index.html is an HTML entry point, "
+    "not a directory; resolve its relative assets and API URLs from the app root. */"
+    "if(path==='/static/index.html'||path==='/static/'){path='/';}"
+)
+
+
+def patch_index_html(source: str) -> str:
+    if INDEX_BASE_MARKER in source:
+        return source
+    if source.count(INDEX_BASE_ANCHOR) != 1:
+        raise RuntimeError("Pinned WebUI index base anchor changed; refusing to patch")
+    return source.replace(INDEX_BASE_ANCHOR, INDEX_BASE_REPLACEMENT, 1)
+
+
+def _atomic_write(path: Path, content: str) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
     owner = path.stat()
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name+".", suffix=".tmp", dir=str(path.parent))
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(patched)
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_name, mode)
@@ -143,7 +153,37 @@ def apply_patch(path: Path) -> bool:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
-    print("[webui-patch] applied: bounded retries=8; stable reset=20s; journal cursor replay")
+
+
+def apply_patch(path: Path) -> bool:
+    path = path.resolve(strict=True)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("WebUI messages.js must be a regular file")
+    index_path = path.with_name("index.html")
+    if not index_path.is_file() or index_path.is_symlink():
+        raise RuntimeError("WebUI index.html must be a regular file")
+
+    original_messages = path.read_text(encoding="utf-8")
+    original_index = index_path.read_text(encoding="utf-8")
+    patched_messages = patch_messages_js(original_messages)
+    patched_index = patch_index_html(original_index)
+
+    messages_changed = patched_messages != original_messages
+    index_changed = patched_index != original_index
+    if not messages_changed and not index_changed:
+        print("[webui-patch] already applied")
+        return False
+
+    # Both outputs are written atomically so interrupted builds cannot leave a
+    # half-written JavaScript or HTML file behind.
+    if messages_changed:
+        _atomic_write(path, patched_messages)
+    if index_changed:
+        _atomic_write(index_path, patched_index)
+
+    print(
+        "[webui-patch] applied: bounded SSE recovery + safe /static/index.html base"
+    )
     return True
 
 if __name__ == "__main__":
