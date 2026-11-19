@@ -433,9 +433,10 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
     start_hermes_gateway
   fi
 
-  # Content-free verification. Uses local GET endpoints only; it never logs message bodies.
+  # Content-free verification runs in background so WebUI health starts immediately.
   if [ "${WHATSAPP_ENABLED:-false}" = "true" ]; then
-    python3 - <<'PY'
+    (
+      python3 - <<'PY'
 import json, time, urllib.request, urllib.parse
 BASE = "http://127.0.0.1:3000"
 def get(path):
@@ -443,7 +444,7 @@ def get(path):
     with urllib.request.urlopen(req, timeout=5) as response:
         return json.load(response)
 last_error = "bridge_not_ready"
-for _ in range(12):
+for _ in range(30):
     try:
         status = get("/status")
         chats = get("/chats?limit=120").get("chats", [])
@@ -463,6 +464,7 @@ for _ in range(12):
 else:
     print("[whatsapp-readonly-check] connection=unverified credentials=see_session_check probe_error={} read_test=NOT_RUN".format(last_error), flush=True)
 PY
+    ) &
   fi
 fi
 
