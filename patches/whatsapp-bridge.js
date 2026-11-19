@@ -90,11 +90,8 @@ const FORWARD_OWNER_MESSAGES =
   typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
 
-const SEND_READ_RECEIPTS =
-  typeof process !== 'undefined' &&
-  process.env &&
-  typeof process.env.WHATSAPP_SEND_READ_RECEIPTS === 'string' &&
-  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SEND_READ_RECEIPTS.toLowerCase());
+// Hard lock: opening a chat through this bridge must never emit a read receipt.
+const SEND_READ_RECEIPTS = false;
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
@@ -274,6 +271,89 @@ const logger = pino({ level: 'warn' });
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 
+// Read-only view of WhatsApp chats. Never persisted and never used to mark chats read.
+const READ_CACHE_CHAT_LIMIT = 120;
+const READ_CACHE_MESSAGES_LIMIT = 60;
+const readChatCache = new Map();
+const readChatNames = new Map();
+
+function rememberReadChat(chat) {
+  const id = chat?.id?._serialized || chat?.id || chat?.jid;
+  if (!id || id === 'status@broadcast') return;
+  const chatId = String(id);
+  const name = chat?.name || chat?.subject || chat?.formattedTitle;
+  if (name) readChatNames.set(chatId, String(name));
+  if (!readChatCache.has(chatId)) readChatCache.set(chatId, []);
+  while (readChatCache.size > READ_CACHE_CHAT_LIMIT) {
+    const oldest = readChatCache.keys().next().value;
+    readChatCache.delete(oldest);
+    readChatNames.delete(oldest);
+  }
+}
+
+function rememberReadMessage(msg) {
+  const chatId = String(msg?.key?.remoteJid || '');
+  if (!chatId || chatId === 'status@broadcast' || !msg?.message) return;
+  const content = getMessageContent(msg) || {};
+  let type = 'message';
+  let text = '';
+  if (content.conversation || content.extendedTextMessage?.text) {
+    type = 'text';
+    text = content.conversation || content.extendedTextMessage?.text || '';
+  } else if (content.imageMessage) {
+    type = 'image'; text = content.imageMessage.caption || '[image]';
+  } else if (content.videoMessage) {
+    type = 'video'; text = content.videoMessage.caption || '[video]';
+  } else if (content.audioMessage) {
+    type = 'audio'; text = '[audio]';
+  } else if (content.documentMessage) {
+    type = 'document'; text = content.documentMessage.fileName || '[document]';
+  } else if (content.stickerMessage) {
+    type = 'sticker'; text = '[sticker]';
+  } else if (content.locationMessage) {
+    type = 'location'; text = '[location]';
+  } else if (content.pollCreationMessage) {
+    type = 'poll'; text = content.pollCreationMessage.name || '[poll]';
+  } else if (content.reactionMessage) {
+    type = 'reaction'; text = content.reactionMessage.text || '[reaction]';
+  } else {
+    const kind = Object.keys(content)[0] || 'message';
+    type = kind.replace(/Message$/, '').toLowerCase() || 'message';
+    text = `[${type}]`;
+  }
+  const timestamp = Number(msg.messageTimestamp || 0) * 1000;
+  const item = {
+    id: String(msg.key.id || ''),
+    at: Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now(),
+    dir: msg.key.fromMe ? 'out' : 'in',
+    senderId: String(msg.key.participant || chatId),
+    senderName: String(msg.pushName || ''),
+    type,
+    text: String(text || '')
+  };
+  const items = readChatCache.get(chatId) || [];
+  if (item.id && items.some((existing) => existing.id === item.id)) return;
+  items.push(item);
+  items.sort((a, b) => a.at - b.at);
+  if (items.length > READ_CACHE_MESSAGES_LIMIT) items.splice(0, items.length - READ_CACHE_MESSAGES_LIMIT);
+  readChatCache.delete(chatId);
+  readChatCache.set(chatId, items);
+  if (!readChatNames.has(chatId) && item.senderName && !chatId.endsWith('@g.us')) {
+    readChatNames.set(chatId, item.senderName);
+  }
+  while (readChatCache.size > READ_CACHE_CHAT_LIMIT) {
+    const oldest = readChatCache.keys().next().value;
+    readChatCache.delete(oldest);
+    readChatNames.delete(oldest);
+  }
+}
+
+function readCacheMessageCount() {
+  let total = 0;
+  for (const messages of readChatCache.values()) total += messages.length;
+  return total;
+}
+
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
 //   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
@@ -446,7 +526,7 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
-    syncFullHistory: false,
+    syncFullHistory: true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -608,7 +688,19 @@ async function startSocket() {
     }
   });
 
+  sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [] } = {}) => {
+    for (const chat of chats || []) rememberReadChat(chat);
+    for (const contact of contacts || []) {
+      if (contact?.id && contact?.name) readChatNames.set(String(contact.id), String(contact.name));
+    }
+    for (const msg of messages || []) rememberReadMessage(msg);
+    console.log(`[bridge] cached WhatsApp history: ${messages.length} messages across ${readChatCache.size} chats`);
+  });
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // Cache all observed chats before the separate gateway-intake policy runs.
+    // This lets the operator inspect groups/DMs without forwarding them to the agent.
+    for (const msg of messages || []) rememberReadMessage(msg);
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -919,6 +1011,61 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+  if (req.method === 'POST' && req.path === '/read') return next();
+  return res.status(403).json({ error: 'WhatsApp bridge is read-only; write operations are disabled.' });
+});
+
+// Read-only status for the agent skill.
+app.get('/status', (_req, res) => res.json({
+  connection: connectionState === 'connected' ? 'linked' : connectionState,
+  readOnly: true,
+  sendReadReceipts: false,
+  cachedChats: readChatCache.size,
+  cachedMessages: readCacheMessageCount(),
+}));
+
+// List chats present in the memory-only history cache.
+app.get('/chats', (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 60, 1), READ_CACHE_CHAT_LIMIT);
+  const chats = [...readChatCache.entries()].map(([id, messages]) => ({
+    id,
+    name: readChatNames.get(id) || id,
+    isGroup: id.endsWith('@g.us'),
+    messageCount: messages.length,
+    lastMessageAt: messages.length ? new Date(messages[messages.length - 1].at).toISOString() : null,
+    lastMessage: messages.length ? messages[messages.length - 1].text.slice(0, 160) : '',
+  })).sort((a, b) => String(b.lastMessageAt || '').localeCompare(String(a.lastMessageAt || '')));
+  res.json({ chats: chats.slice(0, limit), totalCachedChats: readChatCache.size, readOnly: true });
+});
+
+// Read a chat from cache only. This GET does not call readMessages or change WhatsApp state.
+app.get('/read', (req, res) => {
+  const query = String(req.query.chatId || req.query.name || '').trim().toLowerCase();
+  if (!query) return res.status(400).json({ error: 'chatId or name required' });
+  const matches = [...readChatCache.entries()].filter(([id]) => {
+    const name = String(readChatNames.get(id) || id).toLowerCase();
+    return id.toLowerCase() === query || name === query || id.toLowerCase().includes(query) || name.includes(query);
+  });
+  if (matches.length > 1) {
+    return res.json({ ambiguous: true, candidates: matches.slice(0, 10).map(([id]) => ({
+      id, name: readChatNames.get(id) || id, isGroup: id.endsWith('@g.us'),
+    })) });
+  }
+  if (matches.length === 0) {
+    return res.status(404).json({ error: 'chat_not_in_cache', note: 'No cached messages for this chat yet.' });
+  }
+  const [chatId, items] = matches[0];
+  const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), READ_CACHE_MESSAGES_LIMIT);
+  res.json({
+    chat: { id: chatId, name: readChatNames.get(chatId) || chatId, isGroup: chatId.endsWith('@g.us') },
+    messages: items.slice(-limit).map((item) => ({ ...item, at: new Date(item.at).toISOString() })),
+    cachedMessages: items.length,
+    readOnly: true,
+  });
+});
+
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length).concat(deliveryQueue.splice(0, deliveryQueue.length));
@@ -1219,10 +1366,13 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
-    sendReadReceipts: SEND_READ_RECEIPTS,
+    sendReadReceipts: false,
+    readOnly: true,
+    cachedChats: readChatCache.size,
+    cachedMessages: readCacheMessageCount(),
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
-    capabilities: { outboundMentions: true },
+    capabilities: { outboundMentions: false, readOnly: true },
   });
 });
 
