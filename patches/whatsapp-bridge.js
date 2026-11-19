@@ -527,6 +527,8 @@ async function startSocket() {
     printQRInTerminal: false,
     browser: ['Ubuntu', 'Chrome', '131.0.0.0'],
     syncFullHistory: true,
+    // Do not let Baileys discard FULL history batches from an already-linked device.
+    shouldSyncHistoryMessage: () => true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -688,13 +690,40 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [] } = {}) => {
+  // Chat/contacts metadata can arrive independently from a history payload.
+  // Cache it without storing any message text or mutating WhatsApp state.
+  sock.ev.on('chats.upsert', (chats = []) => {
+    for (const chat of chats || []) rememberReadChat(chat);
+    console.log(`[bridge] WhatsApp chat metadata: ${chats.length} chats`);
+  });
+  sock.ev.on('chats.update', (updates = []) => {
+    for (const update of updates || []) rememberReadChat(update);
+  });
+  sock.ev.on('contacts.upsert', (contacts = []) => {
+    for (const contact of contacts || []) {
+      if (contact?.id && (contact?.name || contact?.notify)) {
+        readChatNames.set(String(contact.id), String(contact.name || contact.notify));
+      }
+    }
+  });
+  sock.ev.on('contacts.update', (updates = []) => {
+    for (const contact of updates || []) {
+      if (contact?.id && (contact?.name || contact?.notify)) {
+        readChatNames.set(String(contact.id), String(contact.name || contact.notify));
+      }
+    }
+  });
+
+  sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [], isLatest = false, progress = null, syncType = null } = {}) => {
     for (const chat of chats || []) rememberReadChat(chat);
     for (const contact of contacts || []) {
-      if (contact?.id && contact?.name) readChatNames.set(String(contact.id), String(contact.name));
+      if (contact?.id && (contact?.name || contact?.notify)) {
+        readChatNames.set(String(contact.id), String(contact.name || contact.notify));
+      }
     }
     for (const msg of messages || []) rememberReadMessage(msg);
-    console.log(`[bridge] cached WhatsApp history: ${messages.length} messages across ${readChatCache.size} chats`);
+    // Content-free diagnostics only: never log message bodies, contact IDs, or chat names.
+    console.log(`[bridge] WhatsApp history batch: chats=${chats.length} messages=${messages.length} sync=${syncType ?? 'unknown'} progress=${progress ?? 'unknown'} latest=${Boolean(isLatest)} cached_chats=${readChatCache.size} cached_messages=${readCacheMessageCount()}`);
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
