@@ -276,6 +276,8 @@ const READ_CACHE_CHAT_LIMIT = 120;
 const READ_CACHE_MESSAGES_LIMIT = 60;
 const readChatCache = new Map();
 const readChatNames = new Map();
+const readHistoryFetchAt = new Map();
+const READ_HISTORY_FETCH_COOLDOWN_MS = 30_000;
 
 function rememberReadChat(chat) {
   const id = chat?.id?._serialized || chat?.id || chat?.jid;
@@ -1051,6 +1053,7 @@ app.get('/status', (_req, res) => res.json({
   connection: connectionState === 'connected' ? 'linked' : connectionState,
   readOnly: true,
   sendReadReceipts: false,
+  credentialsPresent: existsSync(path.join(SESSION_DIR, 'creds.json')),
   cachedChats: readChatCache.size,
   cachedMessages: readCacheMessageCount(),
 }));
@@ -1069,8 +1072,10 @@ app.get('/chats', (req, res) => {
   res.json({ chats: chats.slice(0, limit), totalCachedChats: readChatCache.size, readOnly: true });
 });
 
-// Read a chat from cache only. This GET does not call readMessages or change WhatsApp state.
-app.get('/read', (req, res) => {
+// Read a chat over GET. If at least one message is already cached, request older
+// history from that message's anchor. This is a read-history query only: it never
+// calls readMessages, sends content, or changes the chat's read state.
+app.get('/read', async (req, res) => {
   const query = String(req.query.chatId || req.query.name || '').trim().toLowerCase();
   if (!query) return res.status(400).json({ error: 'chatId or name required' });
   const matches = [...readChatCache.entries()].filter(([id]) => {
@@ -1083,14 +1088,47 @@ app.get('/read', (req, res) => {
     })) });
   }
   if (matches.length === 0) {
-    return res.status(404).json({ error: 'chat_not_in_cache', note: 'No cached messages for this chat yet.' });
+    return res.status(404).json({ error: 'chat_not_in_cache', note: 'No received message exists in this chat cache yet.' });
   }
-  const [chatId, items] = matches[0];
+  const [chatId] = matches[0];
   const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), READ_CACHE_MESSAGES_LIMIT);
+  let historyRequested = false;
+  let historyAdded = 0;
+  const initialItems = readChatCache.get(chatId) || [];
+  const oldest = initialItems[0];
+  const now = Date.now();
+  const lastFetch = readHistoryFetchAt.get(chatId) || 0;
+  if (oldest?.id && initialItems.length < limit && sock && connectionState === 'connected'
+      && now - lastFetch >= READ_HISTORY_FETCH_COOLDOWN_MS) {
+    readHistoryFetchAt.set(chatId, now);
+    historyRequested = true;
+    const before = initialItems.length;
+    let timer;
+    try {
+      const request = sock.fetchMessageHistory(
+        Math.max(25, limit - initialItems.length),
+        { remoteJid: chatId, fromMe: oldest.dir === 'out', id: oldest.id },
+        Math.floor(oldest.at / 1000),
+      ).then(() => true).catch(() => false);
+      const completed = await Promise.race([
+        request,
+        new Promise(resolve => { timer = setTimeout(() => resolve(false), 10_000); }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (completed) await new Promise(resolve => setTimeout(resolve, 3_000));
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      console.warn('[bridge] on-demand WhatsApp history request failed:', err?.message || 'unknown');
+    }
+    historyAdded = Math.max(0, (readChatCache.get(chatId) || []).length - before);
+  }
+  const items = readChatCache.get(chatId) || [];
   res.json({
     chat: { id: chatId, name: readChatNames.get(chatId) || chatId, isGroup: chatId.endsWith('@g.us') },
     messages: items.slice(-limit).map((item) => ({ ...item, at: new Date(item.at).toISOString() })),
     cachedMessages: items.length,
+    historyRequested,
+    historyAdded,
     readOnly: true,
   });
 });

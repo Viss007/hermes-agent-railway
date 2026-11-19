@@ -31,12 +31,14 @@ Use the existing Hermes WhatsApp device session on Railway. It is the linked **G
    ```
 3. Read a selected chat by its exact ID or unique name. URL-encode the value:
    ```bash
-   curl -fsS --max-time 45 --get \
+   curl -fsS --max-time 60 --get \
      --data-urlencode "chatId=${CHAT_ID}" \
      --data-urlencode 'limit=60' \
      http://127.0.0.1:3000/read
    ```
-4. If a name is ambiguous, use the returned candidates and ask which one only when necessary. Prefer the exact chat ID from `/chats`.
+   When a chat already has one cached message, this GET may request older history anchored at that message. It never marks messages read. It is rate-limited per chat.
+4. If a chat is not cached, it needs at least one received message event before the bridge can identify the chat and request older history. Do not send a test message yourself; tell Viss which chat needs a new incoming message.
+5. If a name is ambiguous, use the returned candidates and ask which one only when necessary. Prefer the exact chat ID from `/chats`.
 
 ## Limits and reporting
 
