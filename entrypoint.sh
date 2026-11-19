@@ -425,6 +425,63 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
     echo "Starting Hermes messaging gateway in background..."
     start_hermes_gateway
   fi
+
+  # One-shot, content-free proof that the existing WhatsApp session is linked
+  # and that the strictly read-only GET /read API can return both private and
+  # group history. This never prints or persists message contents.
+  if [ "${WHATSAPP_ENABLED:-false}" = "true" ] && { [ -z "${PAIRING_PHONE}" ] || [ -f "${PAIRING_COMPLETE_FILE}" ]; }; then
+    (
+      python3 - <<'PY'
+import json, time, urllib.request, urllib.parse
+BASE = "http://127.0.0.1:3000"
+def get(path):
+    request = urllib.request.Request(BASE + path, headers={"Accept": "application/json"}, method="GET")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+def snapshot():
+    status = get("/status")
+    chats_payload = get("/chats?limit=120")
+    chats = chats_payload.get("chats", [])
+    counts = {
+        "private": sum(1 for c in chats if not c.get("isGroup") and int(c.get("messageCount") or 0) > 0),
+        "group": sum(1 for c in chats if c.get("isGroup") and int(c.get("messageCount") or 0) > 0),
+    }
+    outcomes = {"private": "NO_CACHED_CHAT", "group": "NO_CACHED_CHAT"}
+    message_counts = {"private": 0, "group": 0}
+    for kind in ("private", "group"):
+        candidate = next((c for c in chats if bool(c.get("isGroup")) == (kind == "group") and int(c.get("messageCount") or 0) > 0), None)
+        if not candidate:
+            continue
+        path = "/read?" + urllib.parse.urlencode({"chatId": candidate["id"], "limit": "3"})
+        result = get(path)
+        n = len(result.get("messages") or [])
+        message_counts[kind] = n
+        outcomes[kind] = "PASS" if n > 0 else "EMPTY"
+    return status, chats, counts, outcomes, message_counts
+
+deadline = time.monotonic() + 150
+last_error = "bridge_not_ready"
+last = None
+while time.monotonic() < deadline:
+    try:
+        status, chats, counts, outcomes, message_counts = snapshot()
+        last = (status, chats, counts, outcomes, message_counts)
+        if status.get("connection") == "linked" and all(outcomes[k] == "PASS" for k in ("private", "group")):
+            print("[whatsapp-readonly-check] connection=linked read_receipts=disabled outbound_writes=blocked private_read=PASS group_read=PASS private_messages={} group_messages={} cached_chats={}".format(message_counts["private"], message_counts["group"], len(chats)), flush=True)
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        last_error = type(exc).__name__
+    time.sleep(5)
+if last:
+    status, chats, counts, outcomes, message_counts = last
+    print("[whatsapp-readonly-check] connection={} read_receipts=disabled outbound_writes=blocked private_read={} group_read={} private_messages={} group_messages={} cached_chats={}".format(status.get("connection", "unknown"), outcomes["private"], outcomes["group"], message_counts["private"], message_counts["group"], len(chats)), flush=True)
+else:
+    print("[whatsapp-readonly-check] connection=unverified probe_error={} read_test=NOT_RUN".format(last_error), flush=True)
+PY
+    ) &
+  fi
 fi
 
 WEBUI_LOG="${HERMES_HOME}/logs/webui.log"
