@@ -361,7 +361,7 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
   GATEWAY_PID_FILE="${HERMES_HOME}/gateway.pid"
   WHATSAPP_SESSION_DIR="${HERMES_HOME}/platforms/whatsapp/session"
   PAIRING_PHONE="${WHATSAPP_PAIRING_PHONE_NUMBER:-}"
-  if [ -n "${PAIRING_PHONE}" ] && [ ! -s "${WHATSAPP_SESSION_DIR}/creds.json" ]; then
+  if [ -n "${PAIRING_PHONE}" ]; then
     echo "Starting one-shot WhatsApp phone-number pairing before the gateway..."
     mkdir -p "${WHATSAPP_SESSION_DIR}"
     if [ "$(id -u)" = "0" ]; then
