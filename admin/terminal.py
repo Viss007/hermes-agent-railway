@@ -28,6 +28,8 @@ from pathlib import Path
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from .security import same_origin
+
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/data"))
 HERMES_BIN = "/opt/hermes/.venv/bin/hermes"
@@ -88,13 +90,11 @@ async def shell_ws(websocket: WebSocket) -> None:
 
 
 async def _check_auth(websocket: WebSocket) -> bool:
-    """Validate the hermes_session cookie by hitting an authenticated WebUI endpoint.
-
-    hermes-webui has no dedicated /api/auth/check, so we probe /api/onboarding/status
-    which (a) requires auth when a password is configured and (b) is cheap.
-    """
+    """Validate same-origin browser access and the authenticated WebUI session."""
     import httpx
 
+    if not same_origin(websocket.headers):
+        return False
     cookie_header = websocket.headers.get("cookie", "")
     if not cookie_header:
         return False
@@ -108,7 +108,7 @@ async def _check_auth(websocket: WebSocket) -> bool:
                 headers={"cookie": cookie_header, "host": f"{proxy.WEBUI_HOST}:{proxy.WEBUI_PORT}"},
             )
         return r.status_code == 200
-    except (httpx.ConnectError, httpx.ReadTimeout):
+    except httpx.HTTPError:
         return False
 
 
@@ -416,9 +416,11 @@ async def _bridge(
         except Exception:
             pass
 
-        for task in (writer_task, reader_task):
-            if not task.done():
-                task.cancel()
+        pending_tasks = [task for task in (writer_task, reader_task) if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         # On clean exit of an OAuth one-shot, normalize state and trigger a
         # webui restart so the user sees a fresh catalog/sessions on the next

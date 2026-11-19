@@ -19,6 +19,8 @@ from starlette.responses import HTMLResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from . import proxy as hermes_proxy
+from .security import same_origin
 from .proxy import (
     PROXY_METHODS,
     _filter_response_headers,
@@ -107,7 +109,43 @@ async def _ensure_dashboard_client() -> httpx.AsyncClient:
     return _dashboard_client
 
 
+async def _webui_session_valid(cookie: str) -> bool:
+    if not cookie:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as auth_client:
+            response = await auth_client.get(
+                f"{hermes_proxy.WEBUI_BASE_URL}/api/onboarding/status",
+                headers={
+                    "cookie": cookie,
+                    "host": f"{hermes_proxy.WEBUI_HOST}:{hermes_proxy.WEBUI_PORT}",
+                },
+            )
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
 async def dashboard_http_proxy(request: Request) -> Response:
+    # The dashboard CLI may not enforce the WebUI login itself. Protect every
+    # dashboard page, API request and asset with the WebUI session cookie.
+    if (
+        request.headers.get("origin")
+        or request.method not in ("GET", "HEAD", "OPTIONS")
+    ) and not same_origin(request.headers):
+        return Response(
+            "Cross-origin request rejected.",
+            status_code=403,
+            headers={"Cache-Control": "no-store"},
+            media_type="text/plain",
+        )
+    if not await _webui_session_valid(request.headers.get("cookie", "")):
+        return Response(
+            "Authentication required.",
+            status_code=401,
+            headers={"Cache-Control": "no-store"},
+            media_type="text/plain",
+        )
     path = request.url.path or "/"
     if request.url.query:
         path = f"{path}?{request.url.query}"
@@ -129,10 +167,11 @@ async def dashboard_http_proxy(request: Request) -> Response:
             content=body if body else None,
         )
         upstream = await client.send(req, stream=True)
-    except httpx.ConnectError:
+    except httpx.HTTPError:
         return HTMLResponse(
             _DASH_UNAVAILABLE_HTML.format(DASHBOARD_MOUNT_PREFIX),
             status_code=502,
+            headers={"Cache-Control": "no-store"},
         )
 
     async def body_iter():
@@ -151,6 +190,13 @@ async def dashboard_http_proxy(request: Request) -> Response:
 
 
 async def dashboard_ws_proxy(websocket: WebSocket) -> None:
+    # Require the same authenticated WebUI session as dashboard HTTP.
+    if not same_origin(websocket.headers) or not await _webui_session_valid(
+        websocket.headers.get("cookie", "")
+    ):
+        await websocket.close(code=4401)
+        return
+
     raw_path = websocket.path_params.get("path", "")
     path = "/" + raw_path if not raw_path.startswith("/") else raw_path
     qs = websocket.scope.get("query_string", b"").decode()
@@ -205,6 +251,8 @@ async def dashboard_ws_proxy(websocket: WebSocket) -> None:
             )
             for task in pending:
                 task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
     except (websockets.WebSocketException, OSError):
         pass
     finally:

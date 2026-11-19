@@ -1,4 +1,4 @@
-from patches.patch_webui_sse import MARKER, OLD_ERROR, patch_messages_js
+from patches.patch_webui_sse import MARKER, OLD_ERROR, patch_index_html, patch_messages_js
 
 def test_patch_adds_bounded_reconnects_and_replay_cursor():
     source = (
@@ -34,3 +34,25 @@ def test_patch_fails_closed_when_upstream_changes():
         assert "anchor changed" in str(exc)
     else:
         raise AssertionError("unexpected upstream source must not be patched")
+
+
+
+def test_index_base_patch_fixes_direct_static_entrypoint():
+    source = (
+        "<script>(function(){var path=location.pathname,marker='/session/',i=path.indexOf(marker),p;"
+        "i>=0?p=(path.slice(0,i+1)||'/'):p=(path.endsWith('/')?path:(path.replace(/\\/[^\\/]*$/,'/')||'/'));"
+        "document.write('<base href="'+location.origin+p+'">');})()</script>"
+    )
+    patched = patch_index_html(source)
+    assert "RAILWAY_STATIC_INDEX_BASE_FIX_V1" in patched
+    assert "path==='/static/index.html'||path==='/static/'" in patched
+    assert patch_index_html(patched) == patched
+
+
+def test_index_base_patch_fails_closed_when_upstream_changes():
+    try:
+        patch_index_html("<html><head></head></html>")
+    except RuntimeError as exc:
+        assert "index base anchor changed" in str(exc)
+    else:
+        raise AssertionError("unexpected index source must not be patched")

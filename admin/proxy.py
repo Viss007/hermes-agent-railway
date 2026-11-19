@@ -253,10 +253,11 @@ async def http_proxy(request: Request) -> Response:
             content=body if body else None,
         )
         upstream = await client.send(req, stream=True)
-    except httpx.ConnectError:
+    except httpx.HTTPError:
         return Response(
             "Hermes WebUI unavailable.",
             status_code=502,
+            headers={"Cache-Control": "no-store"},
             media_type="text/plain",
         )
 
@@ -360,6 +361,8 @@ async def ws_proxy(websocket: WebSocket) -> None:
             )
             for task in pending:
                 task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
     except (websockets.WebSocketException, OSError):
         pass
     finally:
