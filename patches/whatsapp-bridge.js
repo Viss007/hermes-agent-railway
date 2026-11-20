@@ -507,6 +507,10 @@ let lastDisconnectedAt = null;
 let lastConnectedAt = null;
 let historyBatchCount = 0;
 let lastHistoryBatch = null;
+let appStateResyncAttempted = false;
+let appStateResyncStatus = 'not_started';
+let appStateResyncAt = null;
+const READ_ONLY_APP_STATE_COLLECTIONS = ['regular_high', 'regular_low', 'regular'];
 let pairingCodeRequested = false;
 
 function emitPairEvent(event) {
@@ -647,6 +651,29 @@ async function startSocket() {
       emitPairEvent({ event: 'connected', user: connectedUser });
       if (!PAIR_JSON) {
         console.log('✅ WhatsApp connected!');
+      }
+      if (!PAIR_ONLY && !appStateResyncAttempted) {
+        appStateResyncAttempted = true;
+        appStateResyncStatus = 'running';
+        const connectedSocket = sock;
+        setTimeout(() => {
+          if (!connectedSocket || typeof connectedSocket.resyncAppState !== 'function') {
+            appStateResyncStatus = 'unavailable';
+            console.warn('[bridge] WhatsApp read-only app-state sync unavailable');
+            return;
+          }
+          // Fetch existing WhatsApp app-state patches and apply them locally.
+          connectedSocket.resyncAppState(READ_ONLY_APP_STATE_COLLECTIONS, true).then(() => {
+            appStateResyncStatus = 'complete';
+            appStateResyncAt = Date.now();
+            console.log(`[bridge] WhatsApp read-only app-state sync complete collections=${READ_ONLY_APP_STATE_COLLECTIONS.length} cached_chats=${readChatCache.size}`);
+          }).catch((error) => {
+            appStateResyncStatus = 'failed';
+            appStateResyncAt = Date.now();
+            const code = error?.output?.statusCode ?? error?.statusCode ?? 'unknown';
+            console.warn(`[bridge] WhatsApp read-only app-state sync failed: ${error?.name || 'Error'} code=${code}`);
+          });
+        }, 1500);
       }
       if (PAIR_ONLY) {
         if (!PAIR_JSON) {
@@ -1097,6 +1124,8 @@ app.get('/status', (_req, res) => res.json({
   lastConnectedAt: lastConnectedAt ? new Date(lastConnectedAt).toISOString() : null,
   historyBatchCount,
   lastHistoryBatch: lastHistoryBatch ? { ...lastHistoryBatch, at: new Date(lastHistoryBatch.at).toISOString() } : null,
+  appStateResyncStatus,
+  appStateResyncAt: appStateResyncAt ? new Date(appStateResyncAt).toISOString() : null,
   bridgeEventCounts: { ...bridgeEventCounts },
   cachedChats: readChatCache.size,
   cachedMessages: readCacheMessageCount(),

@@ -451,12 +451,14 @@ def safe_status(status):
         "read_receipts": "disabled" if status.get("sendReadReceipts") is False else "UNVERIFIED",
         "outbound_writes": "blocked" if status.get("readOnly") else "UNVERIFIED",
         "disconnect_reason": status.get("lastDisconnectReason"),
+        "app_state_sync": status.get("appStateResyncStatus", "unknown"),
         "history_batches": status.get("historyBatchCount", 0),
         "last_batch_chats": batch.get("chats", 0),
         "last_batch_messages": batch.get("messages", 0),
         "cached_chats": status.get("cachedChats", 0),
         "cached_messages": status.get("cachedMessages", 0),
         "bridge_events": status.get("bridgeEventCounts", {}),
+    "app_state_sync": status.get("appStateResyncStatus", "unknown"),
     }
 last = None
 status = None
@@ -483,8 +485,19 @@ if not status or status.get("connection") != "linked":
     except Exception as exc:
         print("[whatsapp-readonly-final] bridge_unavailable=" + type(exc).__name__, flush=True)
     raise SystemExit(0)
-# Allow the already-linked device to finish its initial history sync.
+# Allow the already-linked device to finish its read-only app-state and history sync.
 print("[whatsapp-readonly-test] linked_device_confirmed=1", flush=True)
+sync_deadline = time.monotonic() + 90
+while time.monotonic() < sync_deadline:
+    try:
+        status = get("/status")
+        if status.get("appStateResyncStatus") in ("complete", "failed", "unavailable"):
+            break
+        if int(status.get("cachedChats") or 0) > 0:
+            break
+    except Exception:
+        pass
+    time.sleep(3)
 history_deadline = time.monotonic() + 90
 while time.monotonic() < history_deadline:
     try:
