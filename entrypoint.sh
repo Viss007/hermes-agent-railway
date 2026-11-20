@@ -433,23 +433,11 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
     start_hermes_gateway
   fi
 
-  # Only surface connection/history counters from the bridge log, never content or chat identities.
-  (
-    sleep 35
-    BRIDGE_LOG="${HERMES_HOME}/platforms/whatsapp/bridge.log"
-    if [ -f "${BRIDGE_LOG}" ]; then
-      grep -E 'WhatsApp connected!|Connection closed \(reason: [0-9]+\)|WhatsApp history batch:|WhatsApp history status:|WhatsApp chat metadata:' "${BRIDGE_LOG}" | tail -n 60 | sed -E 's/^/[whatsapp-bridge-log] /'
-    else
-      echo "[whatsapp-bridge-log] bridge_log=missing"
-    fi
-  ) &
-
   # Verify the existing linked device and read-only chat access. No message
   # bodies, chat names, JIDs or phone numbers are emitted to Railway logs.
   if [ "${WHATSAPP_ENABLED:-false}" = "true" ]; then
-    (
-      python3 - <<'PY'
-import json, time, urllib.request, urllib.parse
+    nohup python3 - <<'PY' >/proc/1/fd/1 2>&1 &
+import json, time, urllib.request, urllib.parse, re
 BASE = "http://127.0.0.1:3000"
 def get(path, timeout=15):
     req = urllib.request.Request(BASE + path, headers={"Accept": "application/json"}, method="GET")
@@ -527,8 +515,26 @@ final.update({
     "group_chat_candidates": sum(1 for c in chats if c.get("isGroup") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))),
 })
 print("[whatsapp-readonly-final] " + json.dumps(final, sort_keys=True), flush=True)
+# Emit only fixed-format connection and sync counters from the bridge log.
+bridge_log = "/data/platforms/whatsapp/bridge.log"
+patterns = [
+    r"WhatsApp connected!",
+    r"Connection closed \(reason: [0-9]+\)\.",
+    r"WhatsApp history batch: chats=[0-9]+ messages=[0-9]+ sync=[^ ]+ progress=[^ ]+ latest=(true|false) cached_chats=[0-9]+ cached_messages=[0-9]+",
+    r"WhatsApp history status: sync=[^ ]+ status=[^ ]+ explicit=(true|false)",
+    r"WhatsApp chat metadata: [0-9]+ chats",
+]
+try:
+    with open(bridge_log, encoding="utf-8", errors="replace") as handle:
+        for line in handle.readlines()[-120:]:
+            for pattern in patterns:
+                match = re.search(pattern, line)
+                if match:
+                    print("[whatsapp-bridge-log] " + match.group(0), flush=True)
+                    break
+except Exception as exc:
+    print("[whatsapp-bridge-log] unavailable=" + type(exc).__name__, flush=True)
 PY
-    ) &
   fi
 fi
 
