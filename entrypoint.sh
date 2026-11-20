@@ -487,7 +487,7 @@ if not status or status.get("connection") != "linked":
     raise SystemExit(0)
 # Allow the already-linked device to finish its read-only app-state and history sync.
 print("[whatsapp-readonly-test] linked_device_confirmed=1", flush=True)
-sync_deadline = time.monotonic() + 90
+sync_deadline = time.monotonic() + 45
 while time.monotonic() < sync_deadline:
     try:
         status = get("/status")

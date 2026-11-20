@@ -510,7 +510,7 @@ let lastHistoryBatch = null;
 let appStateResyncAttempted = false;
 let appStateResyncStatus = 'not_started';
 let appStateResyncAt = null;
-const READ_ONLY_APP_STATE_COLLECTIONS = ['regular_high', 'regular_low', 'regular'];
+const READ_ONLY_APP_STATE_COLLECTIONS = ['regular_low'];
 let pairingCodeRequested = false;
 
 function emitPairEvent(event) {
@@ -669,7 +669,7 @@ async function startSocket() {
             appStateResyncStatus = 'timed_out';
             appStateResyncAt = Date.now();
             console.warn('[bridge] WhatsApp read-only app-state sync timed out');
-          }, 60_000);
+          }, 30_000);
           connectedSocket.resyncAppState(READ_ONLY_APP_STATE_COLLECTIONS, true).then(() => {
             appStateSettled = true;
             appStateResyncStatus = 'complete';
