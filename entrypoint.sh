@@ -433,36 +433,85 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
     start_hermes_gateway
   fi
 
-  # Content-free verification runs in background so WebUI health starts immediately.
+  # Verify the existing linked device and read-only chat access. No message
+  # bodies, chat names, JIDs or phone numbers are emitted to Railway logs.
   if [ "${WHATSAPP_ENABLED:-false}" = "true" ]; then
     (
       python3 - <<'PY'
 import json, time, urllib.request, urllib.parse
 BASE = "http://127.0.0.1:3000"
-def get(path):
+def get(path, timeout=15):
     req = urllib.request.Request(BASE + path, headers={"Accept": "application/json"}, method="GET")
-    with urllib.request.urlopen(req, timeout=5) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
-last_error = "bridge_not_ready"
-for _ in range(30):
+def safe_status(status):
+    batch = status.get("lastHistoryBatch") or {}
+    return {
+        "connection": status.get("connection", "unknown"),
+        "credentials": "present" if status.get("credentialsPresent") else "missing",
+        "read_receipts": "disabled" if status.get("sendReadReceipts") is False else "UNVERIFIED",
+        "outbound_writes": "blocked" if status.get("readOnly") else "UNVERIFIED",
+        "disconnect_reason": status.get("lastDisconnectReason"),
+        "history_batches": status.get("historyBatchCount", 0),
+        "last_batch_chats": batch.get("chats", 0),
+        "last_batch_messages": batch.get("messages", 0),
+        "cached_chats": status.get("cachedChats", 0),
+        "cached_messages": status.get("cachedMessages", 0),
+    }
+last = None
+status = None
+connect_deadline = time.monotonic() + 180
+while time.monotonic() < connect_deadline:
     try:
         status = get("/status")
-        chats = get("/chats?limit=120").get("chats", [])
-        counts = {"private": 0, "group": 0}
-        for kind in ("private", "group"):
-            candidate = next((c for c in chats if bool(c.get("isGroup")) == (kind == "group") and int(c.get("messageCount") or 0) > 0), None)
-            if candidate:
-                result = get("/read?" + urllib.parse.urlencode({"chatId": candidate["id"], "limit": "3"}))
-                counts[kind] = len(result.get("messages") or [])
-        print("[whatsapp-readonly-check] connection={} credentials={} read_receipts=disabled outbound_writes=blocked cached_chats={} cached_messages={} private_messages={} group_messages={}".format(
-            status.get("connection", "unknown"), "present" if status.get("credentialsPresent") else "missing",
-            len(chats), status.get("cachedMessages", 0), counts["private"], counts["group"]), flush=True)
-        break
+        snap = safe_status(status)
+        if snap != last:
+            print("[whatsapp-readonly-status] " + json.dumps(snap, sort_keys=True), flush=True)
+            last = snap
+        if status.get("connection") == "linked":
+            break
     except Exception as exc:
-        last_error = type(exc).__name__
-        time.sleep(2)
-else:
-    print("[whatsapp-readonly-check] connection=unverified credentials=see_session_check probe_error={} read_test=NOT_RUN".format(last_error), flush=True)
+        kind = type(exc).__name__
+        if kind != last:
+            print("[whatsapp-readonly-status] bridge_probe=" + kind, flush=True)
+            last = kind
+    time.sleep(3)
+if not status or status.get("connection") != "linked":
+    try:
+        status = get("/status")
+        print("[whatsapp-readonly-final] " + json.dumps(safe_status(status), sort_keys=True), flush=True)
+    except Exception as exc:
+        print("[whatsapp-readonly-final] bridge_unavailable=" + type(exc).__name__, flush=True)
+    raise SystemExit(0)
+# Allow the already-linked device to finish its initial history sync.
+history_deadline = time.monotonic() + 180
+while time.monotonic() < history_deadline:
+    try:
+        status = get("/status")
+        if int(status.get("cachedMessages") or 0) > 0:
+            break
+    except Exception:
+        pass
+    time.sleep(5)
+chats = get("/chats?limit=120").get("chats", [])
+read_counts = {"private": 0, "group": 0}
+for kind in ("private", "group"):
+    candidate = next((c for c in chats if bool(c.get("isGroup")) == (kind == "group") and int(c.get("messageCount") or 0) > 0), None)
+    if candidate:
+        try:
+            result = get("/read?" + urllib.parse.urlencode({"chatId": candidate["id"], "limit": "3"}), timeout=45)
+            read_counts[kind] = len(result.get("messages") or [])
+        except Exception:
+            read_counts[kind] = -1
+status = get("/status")
+final = safe_status(status)
+final.update({
+    "private_read_messages": read_counts["private"],
+    "group_read_messages": read_counts["group"],
+    "private_chat_candidates": sum(1 for c in chats if not c.get("isGroup") and int(c.get("messageCount") or 0) > 0),
+    "group_chat_candidates": sum(1 for c in chats if c.get("isGroup") and int(c.get("messageCount") or 0) > 0),
+})
+print("[whatsapp-readonly-final] " + json.dumps(final, sort_keys=True), flush=True)
 PY
     ) &
   fi

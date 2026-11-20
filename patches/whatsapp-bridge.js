@@ -489,6 +489,11 @@ function enqueueDeliveryStatus(args) {
 
 let sock = null;
 let connectionState = 'disconnected';
+let lastDisconnectReason = null;
+let lastDisconnectedAt = null;
+let lastConnectedAt = null;
+let historyBatchCount = 0;
+let lastHistoryBatch = null;
 let pairingCodeRequested = false;
 
 function emitPairEvent(event) {
@@ -594,6 +599,8 @@ async function startSocket() {
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      lastDisconnectReason = Number.isFinite(reason) ? reason : null;
+      lastDisconnectedAt = Date.now();
       connectionState = 'disconnected';
 
       if (reason === DisconnectReason.loggedOut) {
@@ -616,6 +623,8 @@ async function startSocket() {
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      lastDisconnectReason = null;
+      lastConnectedAt = Date.now();
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -717,6 +726,11 @@ async function startSocket() {
   });
 
   sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [], isLatest = false, progress = null, syncType = null } = {}) => {
+    historyBatchCount += 1;
+    lastHistoryBatch = {
+      at: Date.now(), chats: chats.length, messages: messages.length,
+      syncType: syncType ?? null, progress: progress ?? null, isLatest: Boolean(isLatest),
+    };
     for (const chat of chats || []) rememberReadChat(chat);
     for (const contact of contacts || []) {
       if (contact?.id && (contact?.name || contact?.notify)) {
@@ -1054,6 +1068,11 @@ app.get('/status', (_req, res) => res.json({
   readOnly: true,
   sendReadReceipts: false,
   credentialsPresent: existsSync(path.join(SESSION_DIR, 'creds.json')),
+  lastDisconnectReason,
+  lastDisconnectedAt: lastDisconnectedAt ? new Date(lastDisconnectedAt).toISOString() : null,
+  lastConnectedAt: lastConnectedAt ? new Date(lastConnectedAt).toISOString() : null,
+  historyBatchCount,
+  lastHistoryBatch: lastHistoryBatch ? { ...lastHistoryBatch, at: new Date(lastHistoryBatch.at).toISOString() } : null,
   cachedChats: readChatCache.size,
   cachedMessages: readCacheMessageCount(),
 }));
