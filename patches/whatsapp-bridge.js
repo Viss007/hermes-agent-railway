@@ -663,16 +663,25 @@ async function startSocket() {
             return;
           }
           // Fetch existing WhatsApp app-state patches and apply them locally.
+          let appStateSettled = false;
+          const appStateTimeout = setTimeout(() => {
+            if (appStateSettled) return;
+            appStateResyncStatus = 'timed_out';
+            appStateResyncAt = Date.now();
+            console.warn('[bridge] WhatsApp read-only app-state sync timed out');
+          }, 60_000);
           connectedSocket.resyncAppState(READ_ONLY_APP_STATE_COLLECTIONS, true).then(() => {
+            appStateSettled = true;
             appStateResyncStatus = 'complete';
             appStateResyncAt = Date.now();
             console.log(`[bridge] WhatsApp read-only app-state sync complete collections=${READ_ONLY_APP_STATE_COLLECTIONS.length} cached_chats=${readChatCache.size}`);
           }).catch((error) => {
+            appStateSettled = true;
             appStateResyncStatus = 'failed';
             appStateResyncAt = Date.now();
             const code = error?.output?.statusCode ?? error?.statusCode ?? 'unknown';
             console.warn(`[bridge] WhatsApp read-only app-state sync failed: ${error?.name || 'Error'} code=${code}`);
-          });
+          }).finally(() => clearTimeout(appStateTimeout));
         }, 1500);
       }
       if (PAIR_ONLY) {
@@ -1141,7 +1150,7 @@ app.get('/chats', (req, res) => {
     messageCount: messages.length,
     lastMessageAt: messages.length ? new Date(messages[messages.length - 1].at).toISOString()
       : (readChatMeta.get(id)?.lastMessageAt ? new Date(readChatMeta.get(id).lastMessageAt).toISOString() : null),
-    hasHistoryAnchor: Boolean(messages[0]?.id || readChatMeta.get(id)?.lastMessageAt),
+    hasHistoryAnchor: Boolean(messages[0]?.id || readChatMeta.get(id)?.lastMessageAt || readChatCache.has(id)),
     lastMessage: messages.length ? messages[messages.length - 1].text.slice(0, 160) : '',
   })).sort((a, b) => String(b.lastMessageAt || '').localeCompare(String(a.lastMessageAt || '')));
   res.json({ chats: chats.slice(0, limit), totalCachedChats: readChatCache.size, readOnly: true });
@@ -1172,10 +1181,11 @@ app.get('/read', async (req, res) => {
   const initialItems = readChatCache.get(chatId) || [];
   const oldest = initialItems[0];
   const chatMeta = readChatMeta.get(chatId) || {};
-  const historyAnchorAt = oldest?.at || chatMeta.lastMessageAt || 0;
+  const historyAnchorAt = oldest?.at || chatMeta.lastMessageAt || Date.now();
+  const historyAnchorType = oldest?.id ? 'cached_message' : (chatMeta.lastMessageAt ? 'chat_timestamp' : 'latest_probe');
   const now = Date.now();
   const lastFetch = readHistoryFetchAt.get(chatId) || 0;
-  if (historyAnchorAt > 0 && initialItems.length < limit && sock && connectionState === 'connected'
+  if (initialItems.length < limit && sock && connectionState === 'connected'
       && now - lastFetch >= READ_HISTORY_FETCH_COOLDOWN_MS) {
     readHistoryFetchAt.set(chatId, now);
     historyRequested = true;
@@ -1206,8 +1216,8 @@ app.get('/read', async (req, res) => {
     cachedMessages: items.length,
     historyRequested,
     historyAdded,
-    historyAnchor: oldest?.id ? 'cached_message' : (chatMeta.lastMessageAt ? 'chat_timestamp' : null),
-    historyUnavailableReason: items.length === 0 && !chatMeta.lastMessageAt ? 'no_message_or_timestamp_anchor' : null,
+    historyAnchor: historyAnchorType,
+    historyUnavailableReason: items.length === 0 && historyAdded === 0 ? 'no_messages_returned_for_history_request' : null,
     readOnly: true,
   });
 });

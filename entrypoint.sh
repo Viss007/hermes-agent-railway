@@ -491,7 +491,7 @@ sync_deadline = time.monotonic() + 90
 while time.monotonic() < sync_deadline:
     try:
         status = get("/status")
-        if status.get("appStateResyncStatus") in ("complete", "failed", "unavailable"):
+        if status.get("appStateResyncStatus") in ("complete", "failed", "unavailable", "timed_out"):
             break
         if int(status.get("cachedChats") or 0) > 0:
             break
