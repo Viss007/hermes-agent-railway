@@ -433,6 +433,17 @@ if [ "${START_GATEWAY:-false}" = "true" ]; then
     start_hermes_gateway
   fi
 
+  # Only surface connection/history counters from the bridge log, never content or chat identities.
+  (
+    sleep 35
+    BRIDGE_LOG="${HERMES_HOME}/platforms/whatsapp/bridge.log"
+    if [ -f "${BRIDGE_LOG}" ]; then
+      grep -E 'WhatsApp connected!|Connection closed \(reason: [0-9]+\)|WhatsApp history batch:|WhatsApp history status:|WhatsApp chat metadata:' "${BRIDGE_LOG}" | tail -n 60 | sed -E 's/^/[whatsapp-bridge-log] /'
+    else
+      echo "[whatsapp-bridge-log] bridge_log=missing"
+    fi
+  ) &
+
   # Verify the existing linked device and read-only chat access. No message
   # bodies, chat names, JIDs or phone numbers are emitted to Railway logs.
   if [ "${WHATSAPP_ENABLED:-false}" = "true" ]; then
@@ -457,6 +468,7 @@ def safe_status(status):
         "last_batch_messages": batch.get("messages", 0),
         "cached_chats": status.get("cachedChats", 0),
         "cached_messages": status.get("cachedMessages", 0),
+        "bridge_events": status.get("bridgeEventCounts", {}),
     }
 last = None
 status = None
@@ -484,7 +496,8 @@ if not status or status.get("connection") != "linked":
         print("[whatsapp-readonly-final] bridge_unavailable=" + type(exc).__name__, flush=True)
     raise SystemExit(0)
 # Allow the already-linked device to finish its initial history sync.
-history_deadline = time.monotonic() + 180
+print("[whatsapp-readonly-test] linked_device_confirmed=1", flush=True)
+history_deadline = time.monotonic() + 90
 while time.monotonic() < history_deadline:
     try:
         status = get("/status")
@@ -493,10 +506,11 @@ while time.monotonic() < history_deadline:
     except Exception:
         pass
     time.sleep(5)
+print("[whatsapp-readonly-test] history_wait_finished=1", flush=True)
 chats = get("/chats?limit=120").get("chats", [])
 read_counts = {"private": 0, "group": 0}
 for kind in ("private", "group"):
-    candidate = next((c for c in chats if bool(c.get("isGroup")) == (kind == "group") and int(c.get("messageCount") or 0) > 0), None)
+    candidate = next((c for c in chats if bool(c.get("isGroup")) == (kind == "group") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))), None)
     if candidate:
         try:
             result = get("/read?" + urllib.parse.urlencode({"chatId": candidate["id"], "limit": "3"}), timeout=45)
@@ -508,8 +522,9 @@ final = safe_status(status)
 final.update({
     "private_read_messages": read_counts["private"],
     "group_read_messages": read_counts["group"],
-    "private_chat_candidates": sum(1 for c in chats if not c.get("isGroup") and int(c.get("messageCount") or 0) > 0),
-    "group_chat_candidates": sum(1 for c in chats if c.get("isGroup") and int(c.get("messageCount") or 0) > 0),
+    "bridge_events": status.get("bridgeEventCounts", {}),
+    "private_chat_candidates": sum(1 for c in chats if not c.get("isGroup") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))),
+    "group_chat_candidates": sum(1 for c in chats if c.get("isGroup") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))),
 })
 print("[whatsapp-readonly-final] " + json.dumps(final, sort_keys=True), flush=True)
 PY

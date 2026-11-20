@@ -276,6 +276,11 @@ const READ_CACHE_CHAT_LIMIT = 120;
 const READ_CACHE_MESSAGES_LIMIT = 60;
 const readChatCache = new Map();
 const readChatNames = new Map();
+const readChatMeta = new Map();
+const bridgeEventCounts = {
+  chatsUpsert: 0, chatsUpdate: 0, contactsUpsert: 0, contactsUpdate: 0,
+  historySet: 0, historyStatus: 0, messagesUpsert: 0,
+};
 const readHistoryFetchAt = new Map();
 const READ_HISTORY_FETCH_COOLDOWN_MS = 30_000;
 
@@ -283,8 +288,16 @@ function rememberReadChat(chat) {
   const id = chat?.id?._serialized || chat?.id || chat?.jid;
   if (!id || id === 'status@broadcast') return;
   const chatId = String(id);
-  const name = chat?.name || chat?.subject || chat?.formattedTitle;
+  const name = chat?.name || chat?.subject || chat?.formattedTitle || chat?.displayName;
   if (name) readChatNames.set(chatId, String(name));
+  const rawTimestamp = chat?.lastMessageRecvTimestamp ?? chat?.conversationTimestamp ?? chat?.lastMessageTimestamp;
+  const seconds = rawTimestamp == null ? 0 : Number(rawTimestamp);
+  const lastMessageAt = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+  const prior = readChatMeta.get(chatId) || {};
+  readChatMeta.set(chatId, {
+    lastMessageAt: Math.max(prior.lastMessageAt || 0, lastMessageAt),
+    isGroup: chatId.endsWith('@g.us'),
+  });
   if (!readChatCache.has(chatId)) readChatCache.set(chatId, []);
   while (readChatCache.size > READ_CACHE_CHAT_LIMIT) {
     const oldest = readChatCache.keys().next().value;
@@ -704,13 +717,16 @@ async function startSocket() {
   // Chat/contacts metadata can arrive independently from a history payload.
   // Cache it without storing any message text or mutating WhatsApp state.
   sock.ev.on('chats.upsert', (chats = []) => {
+    bridgeEventCounts.chatsUpsert += chats.length;
     for (const chat of chats || []) rememberReadChat(chat);
     console.log(`[bridge] WhatsApp chat metadata: ${chats.length} chats`);
   });
   sock.ev.on('chats.update', (updates = []) => {
+    bridgeEventCounts.chatsUpdate += updates.length;
     for (const update of updates || []) rememberReadChat(update);
   });
   sock.ev.on('contacts.upsert', (contacts = []) => {
+    bridgeEventCounts.contactsUpsert += contacts.length;
     for (const contact of contacts || []) {
       if (contact?.id && (contact?.name || contact?.notify)) {
         readChatNames.set(String(contact.id), String(contact.name || contact.notify));
@@ -718,6 +734,7 @@ async function startSocket() {
     }
   });
   sock.ev.on('contacts.update', (updates = []) => {
+    bridgeEventCounts.contactsUpdate += updates.length;
     for (const contact of updates || []) {
       if (contact?.id && (contact?.name || contact?.notify)) {
         readChatNames.set(String(contact.id), String(contact.name || contact.notify));
@@ -726,6 +743,7 @@ async function startSocket() {
   });
 
   sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [], isLatest = false, progress = null, syncType = null } = {}) => {
+    bridgeEventCounts.historySet += 1;
     historyBatchCount += 1;
     lastHistoryBatch = {
       at: Date.now(), chats: chats.length, messages: messages.length,
@@ -742,7 +760,13 @@ async function startSocket() {
     console.log(`[bridge] WhatsApp history batch: chats=${chats.length} messages=${messages.length} sync=${syncType ?? 'unknown'} progress=${progress ?? 'unknown'} latest=${Boolean(isLatest)} cached_chats=${readChatCache.size} cached_messages=${readCacheMessageCount()}`);
   });
 
+  sock.ev.on('messaging-history.status', ({ syncType = null, status = null, explicit = false } = {}) => {
+    bridgeEventCounts.historyStatus += 1;
+    console.log(`[bridge] WhatsApp history status: sync=${syncType ?? 'unknown'} status=${status ?? 'unknown'} explicit=${Boolean(explicit)}`);
+  });
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    bridgeEventCounts.messagesUpsert += messages?.length || 0;
     // Cache all observed chats before the separate gateway-intake policy runs.
     // This lets the operator inspect groups/DMs without forwarding them to the agent.
     for (const msg of messages || []) rememberReadMessage(msg);
@@ -1073,6 +1097,7 @@ app.get('/status', (_req, res) => res.json({
   lastConnectedAt: lastConnectedAt ? new Date(lastConnectedAt).toISOString() : null,
   historyBatchCount,
   lastHistoryBatch: lastHistoryBatch ? { ...lastHistoryBatch, at: new Date(lastHistoryBatch.at).toISOString() } : null,
+  bridgeEventCounts: { ...bridgeEventCounts },
   cachedChats: readChatCache.size,
   cachedMessages: readCacheMessageCount(),
 }));
@@ -1085,7 +1110,9 @@ app.get('/chats', (req, res) => {
     name: readChatNames.get(id) || id,
     isGroup: id.endsWith('@g.us'),
     messageCount: messages.length,
-    lastMessageAt: messages.length ? new Date(messages[messages.length - 1].at).toISOString() : null,
+    lastMessageAt: messages.length ? new Date(messages[messages.length - 1].at).toISOString()
+      : (readChatMeta.get(id)?.lastMessageAt ? new Date(readChatMeta.get(id).lastMessageAt).toISOString() : null),
+    hasHistoryAnchor: Boolean(messages[0]?.id || readChatMeta.get(id)?.lastMessageAt),
     lastMessage: messages.length ? messages[messages.length - 1].text.slice(0, 160) : '',
   })).sort((a, b) => String(b.lastMessageAt || '').localeCompare(String(a.lastMessageAt || '')));
   res.json({ chats: chats.slice(0, limit), totalCachedChats: readChatCache.size, readOnly: true });
@@ -1115,9 +1142,11 @@ app.get('/read', async (req, res) => {
   let historyAdded = 0;
   const initialItems = readChatCache.get(chatId) || [];
   const oldest = initialItems[0];
+  const chatMeta = readChatMeta.get(chatId) || {};
+  const historyAnchorAt = oldest?.at || chatMeta.lastMessageAt || 0;
   const now = Date.now();
   const lastFetch = readHistoryFetchAt.get(chatId) || 0;
-  if (oldest?.id && initialItems.length < limit && sock && connectionState === 'connected'
+  if (historyAnchorAt > 0 && initialItems.length < limit && sock && connectionState === 'connected'
       && now - lastFetch >= READ_HISTORY_FETCH_COOLDOWN_MS) {
     readHistoryFetchAt.set(chatId, now);
     historyRequested = true;
@@ -1126,8 +1155,8 @@ app.get('/read', async (req, res) => {
     try {
       const request = sock.fetchMessageHistory(
         Math.max(25, limit - initialItems.length),
-        { remoteJid: chatId, fromMe: oldest.dir === 'out', id: oldest.id },
-        Math.floor(oldest.at / 1000),
+        { remoteJid: chatId, fromMe: oldest ? oldest.dir === 'out' : false, id: oldest?.id || '' },
+        Math.floor(historyAnchorAt),
       ).then(() => true).catch(() => false);
       const completed = await Promise.race([
         request,
@@ -1148,6 +1177,8 @@ app.get('/read', async (req, res) => {
     cachedMessages: items.length,
     historyRequested,
     historyAdded,
+    historyAnchor: oldest?.id ? 'cached_message' : (chatMeta.lastMessageAt ? 'chat_timestamp' : null),
+    historyUnavailableReason: items.length === 0 && !chatMeta.lastMessageAt ? 'no_message_or_timestamp_anchor' : null,
     readOnly: true,
   });
 });
