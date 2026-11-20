@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -507,10 +507,8 @@ let lastDisconnectedAt = null;
 let lastConnectedAt = null;
 let historyBatchCount = 0;
 let lastHistoryBatch = null;
-let appStateResyncAttempted = false;
-let appStateResyncStatus = 'not_started';
-let appStateResyncAt = null;
-const READ_ONLY_APP_STATE_COLLECTIONS = ['regular_low'];
+let historyBootstrapStatus = 'not_checked';
+let historyBootstrapAt = null;
 let pairingCodeRequested = false;
 
 function emitPairEvent(event) {
@@ -535,6 +533,21 @@ async function confirmPasskeyCode(code, signal) {
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const historyBootstrapMarker = path.join(path.dirname(SESSION_DIR), '.existing-device-history-bootstrap-attempted');
+  const accountSyncCounter = Number(state.creds.accountSyncCounter || 0);
+  if (!PAIR_ONLY && accountSyncCounter > 0 && !existsSync(historyBootstrapMarker)) {
+    // Existing linked-device credentials otherwise skip the initial history pull.
+    // Reset only this local counter in memory once; do not edit any WhatsApp chat state.
+    state.creds.accountSyncCounter = 0;
+    writeFileSync(historyBootstrapMarker, new Date().toISOString(), { mode: 0o600 });
+    historyBootstrapStatus = 'one_time_retry_requested';
+    historyBootstrapAt = Date.now();
+    console.log('[bridge] existing linked device: one-time history bootstrap requested');
+  } else if (existsSync(historyBootstrapMarker)) {
+    historyBootstrapStatus = 'one_time_retry_already_used';
+  } else {
+    historyBootstrapStatus = 'initial_sync_counter_zero';
+  }
   const version = await getWAVersion();
   if (PAIR_ONLY && !version) {
     emitPairEvent({ event: 'error', error: 'live_whatsapp_version_unavailable' });
@@ -651,38 +664,6 @@ async function startSocket() {
       emitPairEvent({ event: 'connected', user: connectedUser });
       if (!PAIR_JSON) {
         console.log('✅ WhatsApp connected!');
-      }
-      if (!PAIR_ONLY && !appStateResyncAttempted) {
-        appStateResyncAttempted = true;
-        appStateResyncStatus = 'running';
-        const connectedSocket = sock;
-        setTimeout(() => {
-          if (!connectedSocket || typeof connectedSocket.resyncAppState !== 'function') {
-            appStateResyncStatus = 'unavailable';
-            console.warn('[bridge] WhatsApp read-only app-state sync unavailable');
-            return;
-          }
-          // Fetch existing WhatsApp app-state patches and apply them locally.
-          let appStateSettled = false;
-          const appStateTimeout = setTimeout(() => {
-            if (appStateSettled) return;
-            appStateResyncStatus = 'timed_out';
-            appStateResyncAt = Date.now();
-            console.warn('[bridge] WhatsApp read-only app-state sync timed out');
-          }, 30_000);
-          connectedSocket.resyncAppState(READ_ONLY_APP_STATE_COLLECTIONS, true).then(() => {
-            appStateSettled = true;
-            appStateResyncStatus = 'complete';
-            appStateResyncAt = Date.now();
-            console.log(`[bridge] WhatsApp read-only app-state sync complete collections=${READ_ONLY_APP_STATE_COLLECTIONS.length} cached_chats=${readChatCache.size}`);
-          }).catch((error) => {
-            appStateSettled = true;
-            appStateResyncStatus = 'failed';
-            appStateResyncAt = Date.now();
-            const code = error?.output?.statusCode ?? error?.statusCode ?? 'unknown';
-            console.warn(`[bridge] WhatsApp read-only app-state sync failed: ${error?.name || 'Error'} code=${code}`);
-          }).finally(() => clearTimeout(appStateTimeout));
-        }, 1500);
       }
       if (PAIR_ONLY) {
         if (!PAIR_JSON) {
@@ -1133,8 +1114,8 @@ app.get('/status', (_req, res) => res.json({
   lastConnectedAt: lastConnectedAt ? new Date(lastConnectedAt).toISOString() : null,
   historyBatchCount,
   lastHistoryBatch: lastHistoryBatch ? { ...lastHistoryBatch, at: new Date(lastHistoryBatch.at).toISOString() } : null,
-  appStateResyncStatus,
-  appStateResyncAt: appStateResyncAt ? new Date(appStateResyncAt).toISOString() : null,
+  historyBootstrapStatus,
+  historyBootstrapAt: historyBootstrapAt ? new Date(historyBootstrapAt).toISOString() : null,
   bridgeEventCounts: { ...bridgeEventCounts },
   cachedChats: readChatCache.size,
   cachedMessages: readCacheMessageCount(),
