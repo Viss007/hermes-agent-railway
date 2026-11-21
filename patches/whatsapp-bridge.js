@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, renameSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -284,6 +284,42 @@ const bridgeEventCounts = {
 const readHistoryFetchAt = new Map();
 const READ_HISTORY_FETCH_COOLDOWN_MS = 30_000;
 
+// --- durable read cache (local patch) ---
+const READ_CACHE_FILE = path.join(path.dirname(SESSION_DIR), 'read-cache.json');
+let readCacheSaveTimer = null;
+function loadReadCache() {
+  try {
+    const raw = JSON.parse(readFileSync(READ_CACHE_FILE, 'utf8'));
+    for (const [id, meta] of Object.entries(raw.meta || {})) readChatMeta.set(id, meta);
+    for (const [id, name] of Object.entries(raw.names || {})) readChatNames.set(id, name);
+    for (const [id, items] of Object.entries(raw.chats || {})) {
+      if (!Array.isArray(items)) continue;
+      readChatCache.set(id, items.slice(-READ_CACHE_MESSAGES_LIMIT));
+    }
+    console.log(\`[bridge] read cache restored: chats=\${readChatCache.size} messages=\${readCacheMessageCount()}\`);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') console.warn('[bridge] read cache load failed:', err?.message || err);
+  }
+}
+function saveReadCacheNow() {
+  readCacheSaveTimer = null;
+  try {
+    const chats = Object.create(null), names = Object.create(null), meta = Object.create(null);
+    for (const [id, items] of readChatCache) chats[id] = items;
+    for (const [id, name] of readChatNames) names[id] = name;
+    for (const [id, m] of readChatMeta) meta[id] = m;
+    writeFileSync(\`\${READ_CACHE_FILE}.tmp\`, JSON.stringify({ chats, names, meta }));
+    renameSync(\`\${READ_CACHE_FILE}.tmp\`, READ_CACHE_FILE);
+  } catch (err) {
+    console.warn('[bridge] read cache save failed:', err?.message || err);
+  }
+}
+function scheduleReadCacheSave() {
+  if (readCacheSaveTimer) return;
+  readCacheSaveTimer = setTimeout(saveReadCacheNow, 2000);
+  readCacheSaveTimer.unref?.();
+}
+
 function rememberReadChat(chat) {
   const id = chat?.id?._serialized || chat?.id || chat?.jid;
   if (!id || id === 'status@broadcast') return;
@@ -304,6 +340,7 @@ function rememberReadChat(chat) {
     readChatCache.delete(oldest);
     readChatNames.delete(oldest);
   }
+  scheduleReadCacheSave();
 }
 
 function rememberReadMessage(msg) {
@@ -361,6 +398,7 @@ function rememberReadMessage(msg) {
     readChatCache.delete(oldest);
     readChatNames.delete(oldest);
   }
+  scheduleReadCacheSave();
 }
 
 function readCacheMessageCount() {
@@ -368,6 +406,7 @@ function readCacheMessageCount() {
   for (const messages of readChatCache.values()) total += messages.length;
   return total;
 }
+loadReadCache();
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -1152,10 +1191,35 @@ app.get('/read', async (req, res) => {
       id, name: readChatNames.get(id) || id, isGroup: id.endsWith('@g.us'),
     })) });
   }
-  if (matches.length === 0) {
-    return res.status(404).json({ error: 'chat_not_in_cache', note: 'No received message exists in this chat cache yet.' });
+  let chatId;
+  if (matches.length === 1) {
+    chatId = matches[0][0];
+  } else {
+    // A bare JID is addressable even before anything arrived: probe history from now.
+    // A bare phone number is resolved through onWhatsApp first; that only queries.
+    if (!query.includes('@')) {
+      const digits = query.replace(/[^0-9]/g, '');
+      let resolved = null;
+      try {
+        const found = await sock?.onWhatsApp?.(digits);
+        resolved = found?.[0]?.jid || null;
+      } catch (err) {
+        console.warn('[bridge] onWhatsApp lookup failed:', err?.message || err);
+      }
+      if (!resolved) {
+        return res.status(404).json({ error: 'chat_not_found', note: 'Number is not on WhatsApp or is not resolvable.' });
+      }
+      if (!readChatNames.has(resolved)) readChatNames.set(resolved, \`+\${digits}\`);
+      chatId = resolved;
+    } else {
+      chatId = query;
+    }
+    if (!readChatCache.has(chatId)) {
+      readChatCache.set(chatId, []);
+      if (!readChatMeta.has(chatId)) readChatMeta.set(chatId, { lastMessageAt: 0, isGroup: chatId.endsWith('@g.us') });
+      scheduleReadCacheSave();
+    }
   }
-  const [chatId] = matches[0];
   const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), READ_CACHE_MESSAGES_LIMIT);
   let historyRequested = false;
   let historyAdded = 0;

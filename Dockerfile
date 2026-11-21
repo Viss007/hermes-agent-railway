@@ -131,6 +131,8 @@ RUN sed -i 's/\r$//' /opt/hermes-railway/entrypoint.sh && \
     git config --system --add safe.directory /opt/hermes && \
     git config --system --add safe.directory /opt/hermes-webui && \
     gosu hermes python3 /opt/hermes-railway/patches/patch_webui_sse.py /opt/hermes-webui/static/messages.js && \
+    gosu hermes python3 /opt/hermes-railway/patches/patch_webui_mcp_import.py /opt/hermes-webui && \
+    gosu hermes python3 -m py_compile /opt/hermes-webui/api/commands.py /opt/hermes-webui/api/streaming.py && \
     gosu hermes node --check /opt/hermes/scripts/whatsapp-bridge/bridge.js && \
     gosu hermes node --check /opt/hermes-webui/static/messages.js
 
