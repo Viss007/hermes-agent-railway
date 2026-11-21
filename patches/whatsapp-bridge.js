@@ -296,7 +296,7 @@ function loadReadCache() {
       if (!Array.isArray(items)) continue;
       readChatCache.set(id, items.slice(-READ_CACHE_MESSAGES_LIMIT));
     }
-    console.log(\`[bridge] read cache restored: chats=\${readChatCache.size} messages=\${readCacheMessageCount()}\`);
+    console.log(`[bridge] read cache restored: chats=${readChatCache.size} messages=${readCacheMessageCount()}`);
   } catch (err) {
     if (err?.code !== 'ENOENT') console.warn('[bridge] read cache load failed:', err?.message || err);
   }
@@ -308,8 +308,8 @@ function saveReadCacheNow() {
     for (const [id, items] of readChatCache) chats[id] = items;
     for (const [id, name] of readChatNames) names[id] = name;
     for (const [id, m] of readChatMeta) meta[id] = m;
-    writeFileSync(\`\${READ_CACHE_FILE}.tmp\`, JSON.stringify({ chats, names, meta }));
-    renameSync(\`\${READ_CACHE_FILE}.tmp\`, READ_CACHE_FILE);
+    writeFileSync(`${READ_CACHE_FILE}.tmp`, JSON.stringify({ chats, names, meta }));
+    renameSync(`${READ_CACHE_FILE}.tmp`, READ_CACHE_FILE);
   } catch (err) {
     console.warn('[bridge] read cache save failed:', err?.message || err);
   }
@@ -1209,7 +1209,7 @@ app.get('/read', async (req, res) => {
       if (!resolved) {
         return res.status(404).json({ error: 'chat_not_found', note: 'Number is not on WhatsApp or is not resolvable.' });
       }
-      if (!readChatNames.has(resolved)) readChatNames.set(resolved, \`+\${digits}\`);
+      if (!readChatNames.has(resolved)) readChatNames.set(resolved, `+${digits}`);
       chatId = resolved;
     } else {
       chatId = query;
