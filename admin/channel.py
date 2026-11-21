@@ -1,0 +1,1300 @@
+"""Authenticated, durable ChatGPT-to-Hermes message relay.
+
+The public wrapper accepts one narrow chat operation. The Hermes API server remains
+loopback-only and its full toolset is never exposed directly to the internet.
+"""
+from __future__ import annotations
+
+import asyncio
+from contextlib import closing
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import sqlite3
+import shutil
+import time
+from pathlib import Path
+
+import httpx
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+_SYSTEM_MESSAGE = """You are Railway Hermes, the execution agent in a persistent private
+conversation with ChatGPT, acting on behalf of Viss. Treat each authenticated relay
+message as an instruction delegated by Viss. Use your connected tools and persistent
+workspace to complete the requested work, then verify the actual result. Do not replace
+execution with a plan or progress report. Do not claim success without evidence. Keep
+the reply concise and identify only genuine blockers. Follow normal safety, security,
+and approval requirements for irreversible or externally consequential actions."""
+
+_SESSION_ID = os.getenv("HERMES_CHATGPT_SESSION_ID", "chatgpt-operator-channel")
+_CHANNEL_MODEL = os.getenv("HERMES_CHATGPT_CHANNEL_MODEL", "gpt-6-luna")
+_CHANNEL_PROVIDER = os.getenv("HERMES_CHATGPT_CHANNEL_PROVIDER", "openai-codex")
+_API_HOST = os.getenv("API_SERVER_HOST", "127.0.0.1")
+_API_PORT = os.getenv("API_SERVER_PORT", "8642")
+_API_BASE = f"http://{_API_HOST}:{_API_PORT}"
+_LOCK = asyncio.Lock()
+_WORKER_TASK: asyncio.Task | None = None
+_WORKER_STOP_TIMEOUT = 5.0
+_WAKE_EVENT = asyncio.Event()
+_STOP_EVENT = asyncio.Event()
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_LOG = logging.getLogger(__name__)
+
+
+class _TransientApiError(RuntimeError):
+    """A temporary API status before the chat turn was submitted."""
+
+
+def _db_path() -> Path:
+    return Path(os.getenv("HERMES_HOME", "/data")) / ".hermes" / "chatgpt-channel" / "channel.sqlite3"
+
+
+def _connect() -> sqlite3.Connection:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    conn = sqlite3.connect(path, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("BEGIN IMMEDIATE")
+    schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS requests (
+            request_id TEXT PRIMARY KEY,
+            input_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reply TEXT,
+            error TEXT,
+            session_id TEXT,
+            message TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            chat_submitted_at REAL
+        )"""
+    )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    if "message" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN message TEXT")
+    if "attempts" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    if "next_attempt_at" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN next_attempt_at REAL")
+    if "chat_submitted_at" not in columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN chat_submitted_at REAL")
+    if schema_version < 1:
+        # Legacy processing rows predate the durable submission marker. Treat
+        # them as possibly executed; never replay them during schema upgrade.
+        conn.execute(
+            "UPDATE requests SET chat_submitted_at=updated_at WHERE status='processing'"
+        )
+        conn.execute("PRAGMA user_version=1")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS outbox (
+            message_id TEXT PRIMARY KEY,
+            message TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            acked_at REAL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS model_tests (
+            test_key TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            error TEXT
+        )"""
+    )
+    conn.commit()
+    try:
+        os.chmod(path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(path) + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
+    except OSError:
+        pass
+    return conn
+
+
+def _authorized(request: Request) -> bool:
+    expected = os.getenv("HERMES_CHATGPT_CHANNEL_KEY", "")
+    header = request.headers.get("authorization", "")
+    if not expected or not header.startswith("Bearer "):
+        return False
+    supplied = header[7:].strip()
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def _error(message: str, status: int) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message}, status_code=status,
+                        headers={"Cache-Control": "no-store"})
+
+
+def _reserve(request_id: str, input_sha256: str, message: str) -> tuple[str, dict | None]:
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        row = conn.execute(
+            "SELECT * FROM requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        if row is not None:
+            saved = dict(row)
+            if saved["input_sha256"] != input_sha256:
+                return "conflict", saved
+            return "existing", saved
+        conn.execute(
+            """INSERT INTO requests
+               (request_id, input_sha256, status, message, created_at, updated_at)
+               VALUES (?, ?, 'queued', ?, ?, ?)""",
+            (request_id, input_sha256, message, now, now),
+        )
+    return "new", None
+
+
+def _finish(request_id: str, status: str, *, reply: str | None = None,
+            error: str | None = None, session_id: str | None = None) -> None:
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            """UPDATE requests SET status = ?, reply = ?, error = ?,
+               session_id = COALESCE(?, session_id), updated_at = ?
+               WHERE request_id = ?""",
+            (status, reply, error, session_id, time.time(), request_id),
+        )
+
+
+async def _ensure_session(client: httpx.AsyncClient, headers: dict[str, str]) -> None:
+    url = f"{_API_BASE}/api/sessions/{_SESSION_ID}"
+    current = await client.get(url, headers=headers)
+    if current.status_code == 200:
+        return
+    if current.status_code != 404:
+        if current.status_code == 429 or current.status_code >= 500:
+            raise _TransientApiError(f"Hermes session lookup returned HTTP {current.status_code}")
+        raise RuntimeError(f"Hermes session lookup returned HTTP {current.status_code}")
+    created = await client.post(
+        f"{_API_BASE}/api/sessions",
+        headers=headers,
+        json={
+            "id": _SESSION_ID,
+            "source": "api_server",
+            "title": "ChatGPT to Railway Hermes",
+            "system_prompt": _SYSTEM_MESSAGE,
+        },
+    )
+    if created.status_code in (200, 201):
+        return
+    if created.status_code == 429 or created.status_code >= 500:
+        raise _TransientApiError(f"Hermes session creation returned HTTP {created.status_code}")
+    # Concurrent first messages may race to create the same fixed session.
+    if created.status_code == 409:
+        retry = await client.get(url, headers=headers)
+        if retry.status_code == 200:
+            return
+        if retry.status_code == 429 or retry.status_code >= 500:
+            raise _TransientApiError(f"Hermes session verification returned HTTP {retry.status_code}")
+    raise RuntimeError(f"Hermes session creation returned HTTP {created.status_code}")
+
+
+
+
+_AUDIT_SECRET_PATTERNS = (
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]{12,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{25,}\b"),
+)
+
+
+def _audit_redact(value: str, limit: int = 1400) -> str:
+    text = str(value)
+    for pattern in _AUDIT_SECRET_PATTERNS:
+        text = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", text)
+    text = re.sub(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password)(\s*[=:]\s*)\S+",
+                  r"\1\2[REDACTED]", text)
+    return text[:limit]
+
+
+def _audit_content(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _audit_redact(value)
+    if isinstance(value, list):
+        pieces = []
+        for part in value[:40]:
+            if isinstance(part, str):
+                pieces.append(part)
+            elif isinstance(part, dict):
+                kind = str(part.get("type") or "")
+                if isinstance(part.get("text"), str):
+                    pieces.append(part["text"])
+                elif kind in ("image", "image_url", "input_image"):
+                    pieces.append("[image attachment]")
+                elif kind in ("file", "input_file"):
+                    pieces.append("[file attachment]")
+        return _audit_redact("\n".join(pieces))
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return _audit_redact(value["text"])
+        return _audit_redact(json.dumps(value, ensure_ascii=False, default=str))
+    return _audit_redact(str(value))
+
+
+def _audit_message(message: dict) -> dict:
+    role = str(message.get("role") or message.get("type") or "unknown")[:40]
+    item = {
+        "role": role,
+        "content": _audit_content(message.get("content") or message.get("text")),
+    }
+    for key in ("timestamp", "created_at", "name", "tool_call_id", "tool_use_id", "stop_reason"):
+        value = message.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            item[key] = value
+    calls = message.get("tool_calls")
+    if isinstance(calls, list):
+        item["tool_calls"] = []
+        for call in calls[:12]:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            item["tool_calls"].append({
+                "id": _audit_redact(str(call.get("id") or call.get("tool_call_id") or ""), 100),
+                "name": _audit_redact(str(fn.get("name") or call.get("name") or ""), 100),
+                "arguments": _audit_content(fn.get("arguments") or call.get("arguments") or "")[:700],
+            })
+    return item
+
+
+def _audit_pid(pid_file: Path) -> dict:
+    result = {"pid_file": str(pid_file), "pid": None, "running": False, "state": None, "rss_kb": None}
+    try:
+        pid = int(pid_file.read_text().strip())
+        result["pid"] = pid
+        proc = Path("/proc") / str(pid)
+        result["running"] = proc.exists()
+        status = (proc / "status").read_text(errors="replace")
+        for line in status.splitlines():
+            if line.startswith("State:"):
+                result["state"] = line.split(":", 1)[1].strip()
+            elif line.startswith("VmRSS:"):
+                result["rss_kb"] = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
+def _collect_ui_audit(session_limit: int, message_limit: int, focus_sid: str | None) -> dict:
+    home = Path(os.getenv("HERMES_HOME", "/data"))
+    state_dir = Path(os.getenv("HERMES_WEBUI_STATE_DIR", str(home / ".hermes" / "webui")))
+    session_dir = state_dir / "sessions"
+    sessions = []
+    invalid_sessions = 0
+    if session_dir.is_dir():
+        paths = [p for p in session_dir.glob("*.json") if not p.name.startswith("_") and not p.is_symlink()]
+        paths.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        candidates = paths[:max(20, session_limit * 3)]
+        if focus_sid:
+            focus_path = session_dir / (focus_sid + ".json")
+            if focus_path.is_file() and not focus_path.is_symlink() and focus_path not in candidates:
+                candidates.insert(0, focus_path)
+        for path in candidates:
+            try:
+                if path.stat().st_size > 25 * 1024 * 1024:
+                    invalid_sessions += 1
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                invalid_sessions += 1
+                continue
+            if not isinstance(payload, dict):
+                invalid_sessions += 1
+                continue
+            sid = str(payload.get("session_id") or path.stem)
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", sid):
+                continue
+            messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+            try:
+                updated = float(payload.get("updated_at") or payload.get("last_message_at") or payload.get("created_at") or path.stat().st_mtime)
+            except (TypeError, ValueError, OSError):
+                updated = path.stat().st_mtime
+            summary = {
+                "session_id": sid,
+                "title": _audit_redact(str(payload.get("title") or "(untitled)"), 160),
+                "model": _audit_redact(str(payload.get("model") or ""), 120),
+                "model_provider": _audit_redact(str(payload.get("model_provider") or ""), 80),
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+                "last_message_at": payload.get("last_message_at"),
+                "message_count": int(payload.get("message_count") or len(messages) or 0),
+                "active_stream_id": payload.get("active_stream_id"),
+                "pending_started_at": payload.get("pending_started_at"),
+                "pending_user_message": bool(payload.get("pending_user_message")),
+                "input_tokens": payload.get("input_tokens"),
+                "output_tokens": payload.get("output_tokens"),
+                "estimated_cost": payload.get("estimated_cost"),
+                "context_length": payload.get("context_length"),
+                "_sort": updated,
+                "_messages": messages,
+            }
+            sessions.append(summary)
+    sessions.sort(key=lambda x: x["_sort"], reverse=True)
+    chosen = []
+    selected_ids = []
+    if focus_sid and any(x["session_id"] == focus_sid for x in sessions):
+        chosen.append(next(x for x in sessions if x["session_id"] == focus_sid))
+        selected_ids.append(focus_sid)
+    for row in sessions:
+        if row["session_id"] in selected_ids:
+            continue
+        if len(chosen) >= session_limit:
+            break
+        chosen.append(row)
+        selected_ids.append(row["session_id"])
+    out_sessions = []
+    for row in chosen:
+        messages = row.pop("_messages")
+        row.pop("_sort", None)
+        row["recent_messages"] = [_audit_message(m) for m in messages[-message_limit:] if isinstance(m, dict)]
+        out_sessions.append(row)
+    def log_report(path: Path, max_lines: int = 500) -> dict:
+        if not path.is_file() or path.is_symlink():
+            return {"path": str(path), "exists": False, "bytes": 0, "error_count": 0, "errors": []}
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                handle.seek(max(0, size - 1024 * 1024))
+                raw_lines = handle.read(1024 * 1024).decode("utf-8", "replace").splitlines()
+            tail = raw_lines[-max_lines:]
+            relevant = [line for line in tail if re.search(
+                r"(?i)\b(error|exception|traceback|timeout|timed out|cancel|cancelled|killed|oom|429|500|502|503|unauthorized|failed|restart)\b",
+                line,
+            )]
+            return {
+                "path": str(path), "exists": True, "bytes": size,
+                "lines_read": len(tail), "tail_bytes_read": min(size, 1024 * 1024),
+                "error_count_in_tail": sum(1 for line in tail if re.search(r"(?i)\b(error|exception|traceback|timeout|oom|failed)\b", line)),
+                "errors": [_audit_redact(line, 1200) for line in relevant[-60:]],
+            }
+        except OSError as exc:
+            return {"path": str(path), "exists": True, "error": type(exc).__name__}
+    try:
+        usage = shutil.disk_usage(home)
+        disk = {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free,
+                "used_percent": round(100 * usage.used / usage.total, 2) if usage.total else None}
+    except OSError:
+        disk = {}
+    mem = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith(("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:")):
+                k, v = line.split(":", 1)
+                mem[k] = int(v.strip().split()[0])
+    except OSError:
+        pass
+    sessions_meta = {
+        "session_dir": str(session_dir),
+        "exists": session_dir.is_dir(),
+        "json_files": len(paths) if session_dir.is_dir() else 0,
+        "valid_sessions": len(sessions),
+        "invalid_sessions": invalid_sessions,
+    }
+    return {
+        "ok": True,
+        "scope": "read-only-webui-audit",
+        "state_dir": str(state_dir),
+        "sessions": sessions_meta,
+        "selected_sessions": out_sessions,
+        "processes": {
+            "webui": _audit_pid(state_dir / "server.pid"),
+            "gateway": _audit_pid(home / "gateway.pid"),
+        },
+        "memory_kb": mem,
+        "disk": disk,
+        "logs": {
+            "agent": log_report(home / "logs" / "agent.log"),
+            "errors": log_report(home / "logs" / "errors.log"),
+            "webui": log_report(home / "logs" / "webui.log"),
+            "gateway": log_report(home / "logs" / "gateway.log"),
+        },
+        "client_event_log": log_report(state_dir / "client-events.log"),
+    }
+
+
+async def ui_audit(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        session_limit = max(1, min(20, int(request.query_params.get("sessions", "8"))))
+        message_limit = max(1, min(30, int(request.query_params.get("messages", "12"))))
+    except ValueError:
+        return _error("sessions/messages must be integers", 400)
+    focus_sid = request.query_params.get("session_id")
+    if focus_sid and not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", focus_sid):
+        return _error("Invalid session_id", 400)
+    try:
+        result = await asyncio.to_thread(_collect_ui_audit, session_limit, message_limit, focus_sid)
+    except Exception:
+        return _error("Read-only UI audit failed", 500)
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+async def health(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+            response = await client.get(
+                f"{_API_BASE}/v1/capabilities",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if response.status_code != 200:
+            return _error(f"Hermes API server returned HTTP {response.status_code}", 503)
+    except httpx.HTTPError:
+        return _error("Hermes API server is unavailable", 503)
+    return JSONResponse(
+        {"ok": True, "status": "ready", "session_id": _SESSION_ID,
+         "transport": "authenticated-local-api", "storage": "sqlite-persistent",
+         "model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+
+
+async def capabilities(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=3.0)) as client:
+            response = await client.get(
+                f"{_API_BASE}/v1/capabilities",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if response.status_code != 200:
+            return _error(f"Hermes capabilities returned HTTP {response.status_code}", 502)
+        return JSONResponse(response.json(), headers={"Cache-Control": "no-store"})
+    except httpx.HTTPError:
+        return _error("Hermes capabilities endpoint is unavailable", 503)
+    except ValueError:
+        return _error("Hermes capabilities response was invalid JSON", 502)
+
+
+async def _runtime_json(request: Request, path: str) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=3.0)) as client:
+            response = await client.get(
+                f"{_API_BASE}{path}",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if response.status_code != 200:
+            return _error(f"Hermes runtime endpoint returned HTTP {response.status_code}", 502)
+        return JSONResponse(response.json(), headers={"Cache-Control": "no-store"})
+    except httpx.HTTPError:
+        return _error("Hermes runtime endpoint is unavailable", 503)
+    except ValueError:
+        return _error("Hermes runtime response was invalid JSON", 502)
+
+
+async def toolsets(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/v1/toolsets")
+
+
+async def skills(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/v1/skills")
+
+
+async def models(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/v1/models")
+
+async def model_options(request: Request) -> JSONResponse:
+    return await _runtime_json(request, "/api/model/options")
+
+
+async def current_session(request: Request) -> JSONResponse:
+    return await _runtime_json(request, f"/api/sessions/{_SESSION_ID}")
+
+
+def _model_test_identity(test_id: str, model: str, test_kind: str) -> tuple[str, str]:
+    fingerprint = hashlib.sha256(
+        f"{test_id}\0{model}\0{test_kind}".encode("utf-8")
+    ).hexdigest()
+    return "model-test-" + fingerprint[:32], "model-test-" + fingerprint
+
+
+def _reserve_model_test(test_key: str, session_id: str) -> tuple[bool, dict | None]:
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO model_tests(test_key,session_id,status,created_at,updated_at) "
+            "VALUES(?,?,'running',?,?)",
+            (test_key, session_id, now, now),
+        )
+        if cur.rowcount == 1:
+            return True, None
+        row = conn.execute(
+            "SELECT test_key,session_id,status,created_at,updated_at,error "
+            "FROM model_tests WHERE test_key=?",
+            (test_key,),
+        ).fetchone()
+        return False, dict(row) if row is not None else None
+
+
+def _finish_model_test(test_key: str, status: str, error: str | None = None) -> None:
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE model_tests SET status=?,error=?,updated_at=? WHERE test_key=?",
+            (status, _audit_redact(error, 500) if error else None, time.time(), test_key),
+        )
+
+
+async def model_test(request: Request) -> JSONResponse:
+    """Isolated, allowlisted tool-use test; never changes the primary session."""
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 65536):
+        return _error("Request body too large", 413)
+    try:
+        raw = await request.body()
+        if len(raw) > 65536:
+            return _error("Request body too large", 413)
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict):
+        return _error("Expected a JSON object", 400)
+    model = payload.get("model")
+    allowed_models = {"glm-5.3-flash-uncensored", "deepseek-v4.1-flash-uncensored"}
+    if model not in allowed_models:
+        return _error("Model is not in the isolated test allowlist", 400)
+    test_kind = payload.get("test_kind", "terminal")
+    allowed_kinds = {
+        "terminal", "file", "browser", "web", "connections", "bridge",
+        "bridge_phone", "bridge_files",
+    }
+    if test_kind not in allowed_kinds:
+        return _error("test_kind is not in the isolated test allowlist", 400)
+    test_id = payload.get("test_id") or ("test-" + os.urandom(8).hex())
+    if not isinstance(test_id, str) or not _REQUEST_ID_RE.fullmatch(test_id):
+        return _error("test_id must contain 1-128 safe characters", 400)
+    session_id, test_key = _model_test_identity(test_id, model, test_kind)
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        return _error("Hermes API server key is not configured", 503)
+    reserved, previous_test = await asyncio.to_thread(_reserve_model_test, test_key, session_id)
+    if not reserved:
+        previous_status = previous_test.get("status", "unknown") if previous_test else "unknown"
+        return _error(
+            f"This model test ID was already used (status={previous_status}); choose a new test_id",
+            409,
+        )
+    headers = {"Authorization": f"Bearer {api_key}"}
+    test_prompts = {
+        "terminal": (
+            "Use your terminal tool exactly once to run Python that prints the literal "
+            "MODEL_TOOL_PASS. Do not run any other command and do not inspect files or "
+            "environment variables. After the tool returns, reply with only the captured output."
+        ),
+        "file": (
+            f"Use your file tool to create /data/workspace/{test_id}.txt with exactly "
+            "FILE_TOOL_PASS, then read that same file back. Do not inspect any other file. "
+            "Reply with the exact readback."
+        ),
+        "browser": (
+            "Use the browser tool to open https://example.com. Return the page title and "
+            "final URL only. Do not click links or submit forms."
+        ),
+        "web": (
+            "Use the web_search tool to search for NousResearch Hermes Agent. Return the "
+            "top result title and URL only."
+        ),
+        "connections": (
+            "Use your connections tool to list existing connected integrations and their "
+            "authorization status. Do not start OAuth, connect, disconnect or change anything. "
+            "Return only connector names and statuses."
+        ),
+        "bridge": (
+            "Use the configured Personal Control Bridge MCP tools bridge_whoami and "
+            "bridge_health for read-only checks. Do not use terminal or any fallback. "
+            "Return the exact tool names and result statuses."
+        ),
+        "bridge_phone": (
+            "Use Personal Control Bridge tools only. Call bridge_whoami and bridge_health. "
+            "Discover the registered Pixel device ID from those results. Then use bridge_enqueue "
+            "for phone.node.status and phone.a11y.status, polling bridge_command_status for each "
+            "until a terminal receipt. Follow each tool's declared schema; do not guess parameter names. "
+            "Do not use a terminal, UI snapshot, tap, typing or Desktop Commander. Return the device ID, "
+            "tool names, command IDs and terminal PASS/FAIL results."
+        ),
+        "bridge_files": (
+            "Use Personal Control Bridge tools only. Call bridge_whoami and bridge_health. "
+            "Use bridge_enqueue to write BRIDGE_FILE_PASS to acceptance/hermes-bridge-proof.txt "
+            "in the phone agent workspace, read it back, then delete that exact test file using "
+            "the declared confirmation field. Poll bridge_command_status after every command until "
+            "terminal receipts. Follow the tool schemas; do not guess parameter names. Do not use "
+            "terminal, Desktop Commander or direct HTTP. Return the exact readback and deletion result."
+        ),
+    }
+    test_prompt = test_prompts[test_kind]
+    test_system = (
+        "This is an isolated model capability test. Use only the tools explicitly named "
+        "in the test instructions. Do not inspect secrets, credentials, unrelated files or "
+        "personal data. Do not use another tool as a fallback."
+    )
+    try:
+        timeout = httpx.Timeout(300.0, connect=5.0, read=300.0, write=20.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            current = await client.get(f"{_API_BASE}/api/sessions/{session_id}", headers=headers)
+            if current.status_code == 404:
+                created = await client.post(
+                    f"{_API_BASE}/api/sessions",
+                    headers=headers,
+                    json={"id": session_id, "source": "api_server",
+                          "title": f"Model test {test_id}",
+                          "system_prompt": test_system},
+                )
+                if created.status_code not in (200, 201, 409):
+                    detail = " ".join((created.text or "").split())[:1000]
+                    return _error(
+                        f"Test session creation returned HTTP {created.status_code}: {detail}", 502
+                    )
+                if created.status_code == 409:
+                    verify = await client.get(f"{_API_BASE}/api/sessions/{session_id}", headers=headers)
+                    if verify.status_code != 200:
+                        return _error("Test session already existed but could not be verified", 502)
+            elif current.status_code != 200:
+                return _error(f"Test session lookup returned HTTP {current.status_code}", 502)
+            locked = await client.post(
+                f"{_API_BASE}/api/sessions/{session_id}/model",
+                headers=headers,
+                json={"model": model, "provider": "openai-api"},
+            )
+            if locked.status_code != 200:
+                detail = " ".join((locked.text or "").split())[:800]
+                return _error(f"Model lock failed HTTP {locked.status_code}: {detail}", 502)
+            response = await client.post(
+                f"{_API_BASE}/api/sessions/{session_id}/chat",
+                headers=headers,
+                json={"message": test_prompt, "system_message": test_system},
+            )
+        if response.status_code != 200:
+            detail = " ".join((response.text or "").split())[:1200]
+            return _error(f"Model test returned HTTP {response.status_code}: {detail}", 502)
+        result = response.json()
+        content = result.get("message", {}).get("content", "")
+        runtime = result.get("usage", {}).get("runtime", {})
+        await asyncio.to_thread(_finish_model_test, test_key, "completed")
+        return JSONResponse(
+            {"ok": True, "test_id": test_id, "session_id": session_id,
+             "requested_model": model, "provider": "openai-api", "test_kind": test_kind,
+             "status": result.get("status"), "reply": content,
+             "runtime": runtime, "usage": result.get("usage", {})},
+            headers={"Cache-Control": "no-store"},
+        )
+    except httpx.TimeoutException:
+        return _error("Model test exceeded 300 seconds; inspect the isolated session before retrying", 504)
+    except httpx.HTTPError:
+        return _error("Hermes API server was unavailable during model test", 503)
+    except (ValueError, TypeError):
+        return _error("Model test response was invalid", 502)
+
+
+async def diagnostics(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    home = Path(os.getenv("HERMES_HOME", "/data"))
+    cfg_path = home / "config.yaml"
+    auth_path = home / "auth.json"
+    cfg = {}
+    try:
+        import yaml
+        cfg = yaml.safe_load(cfg_path.read_text()) or {} if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    base_url = str(model_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL", ""))
+    from urllib.parse import urlsplit
+    try:
+        base_host = urlsplit(base_url).hostname if base_url else None
+    except ValueError:
+        base_host = "invalid"
+    mcp_cfg = cfg.get("mcp_servers") or cfg.get("mcpServers") or cfg.get("mcp") or {}
+    mcp_servers = []
+    if isinstance(mcp_cfg, dict):
+        for name, value in mcp_cfg.items():
+            item = value if isinstance(value, dict) else {}
+            raw_url = str(item.get("url") or item.get("server_url") or "")
+            try:
+                host = urlsplit(raw_url).hostname if raw_url else None
+            except ValueError:
+                host = "invalid"
+            command = str(item.get("command") or "")
+            mcp_servers.append({
+                "name": str(name)[:100],
+                "enabled": item.get("enabled", True),
+                "transport": str(item.get("transport") or item.get("type") or ("http" if raw_url else "stdio" if command else "unknown"))[:40],
+                "host": host,
+                "command": Path(command).name if command else None,
+            })
+    auth_providers = []
+    try:
+        auth = json.loads(auth_path.read_text()) if auth_path.exists() else {}
+        providers = auth.get("providers", {}) if isinstance(auth, dict) else {}
+        if isinstance(providers, dict):
+            auth_providers = sorted(str(x) for x in providers.keys())
+    except Exception:
+        auth_providers = ["unreadable"]
+    secret_name_prefixes = ("MCP_", "PERSONAL_CONTROL_", "COMPOSIO_", "OPENAI_", "GLM_", "DEEPSEEK_", "XAI_", "FIREWORKS_", "NOVITA_", "ANTHROPIC_", "GOOGLE_", "GITHUB_", "GMAIL_")
+    configured_env_names = sorted(
+        name for name, value in os.environ.items()
+        if name.startswith(secret_name_prefixes) and bool(value)
+    )
+    def dirs(path: Path) -> list[str]:
+        try:
+            return sorted(x.name for x in path.iterdir() if x.is_dir())[:100]
+        except OSError:
+            return []
+    return JSONResponse({
+        "ok": True,
+        "home": str(home),
+        "model": {"provider": model_cfg.get("provider"), "default": model_cfg.get("default"),
+                  "base_url_host": base_host},
+        "auth_providers": auth_providers,
+        "mcp_servers": mcp_servers,
+        "configured_secret_env_names": configured_env_names,
+        "skills_dirs": {"skills": dirs(home / "skills"), "hermes_skills": dirs(home / ".hermes" / "skills")},
+        "channel": {"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
+    }, headers={"Cache-Control": "no-store"})
+
+
+async def configure_primary(request: Request) -> JSONResponse:
+    """Apply the user's explicit primary-model and no-Desktop-Commander policy."""
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict) or payload != {"apply": True}:
+        return _error("This endpoint accepts only {apply:true}", 400)
+    home = Path(os.getenv("HERMES_HOME", "/data"))
+    config_path = home / "config.yaml"
+    backup_path = home / "config.yaml.pre-primary-agent.bak"
+    if not config_path.is_file():
+        return _error("Hermes config.yaml is missing", 404)
+    try:
+        import yaml
+        original = config_path.read_text()
+        cfg = yaml.safe_load(original) or {}
+        if not isinstance(cfg, dict):
+            return _error("Hermes config.yaml root is not a mapping", 500)
+        model_cfg = cfg.setdefault("model", {})
+        if not isinstance(model_cfg, dict):
+            return _error("Hermes model configuration is invalid", 500)
+        old_model = {"provider": model_cfg.get("provider"), "default": model_cfg.get("default")}
+        model_cfg["provider"] = "openai-api"
+        model_cfg["default"] = "deepseek-v4.1-flash-uncensored"
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+        if base_url:
+            model_cfg["base_url"] = base_url
+        mcp_cfg = cfg.get("mcp_servers")
+        disabled = []
+        if isinstance(mcp_cfg, dict):
+            for server_name in ("desktop-commander", "cuebank"):
+                server_cfg = mcp_cfg.get(server_name)
+                if isinstance(server_cfg, dict):
+                    server_cfg["enabled"] = False
+                    disabled.append(server_name)
+        if not backup_path.exists():
+            backup_path.write_text(original)
+            os.chmod(backup_path, 0o600)
+        temp_path = config_path.with_name("config.yaml.primary-agent.tmp")
+        temp_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, config_path)
+        os.chmod(config_path, 0o600)
+        server_states = {}
+        if isinstance(mcp_cfg, dict):
+            for name, value in mcp_cfg.items():
+                server_states[name] = bool(value.get("enabled", True)) if isinstance(value, dict) else True
+        return JSONResponse({
+            "ok": True,
+            "backup": str(backup_path),
+            "previous_model": old_model,
+            "active_default_model": {"provider": model_cfg.get("provider"), "default": model_cfg.get("default")},
+            "disabled_mcp_servers": disabled,
+            "mcp_server_enabled": server_states,
+        }, headers={"Cache-Control": "no-store"})
+    except Exception:
+        return _error("Primary agent configuration update failed", 500)
+
+def _claim_next() -> tuple[str, str] | None:
+    with closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        row = conn.execute(
+            "SELECT request_id, message FROM requests WHERE status = 'queued' "
+            "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+            "ORDER BY created_at LIMIT 1",
+            (now,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        conn.execute(
+            "UPDATE requests SET status='processing', error=NULL, attempts=attempts+1, "
+            "next_attempt_at=NULL, chat_submitted_at=NULL, updated_at=? "
+            "WHERE request_id=? AND status='queued'",
+            (now, row["request_id"]),
+        )
+        conn.commit()
+        return row["request_id"], row["message"] or ""
+
+
+def _release_unsubmitted(request_id: str, error: str) -> None:
+    """Return work to the queue on shutdown when no chat turn was submitted."""
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE requests SET status='queued', attempts=MAX(attempts-1, 0), "
+            "next_attempt_at=NULL, chat_submitted_at=NULL, error=?, updated_at=? "
+            "WHERE request_id=? AND status='processing'",
+            (_audit_redact(error, 500), time.time(), request_id),
+        )
+
+
+def _retryable_admission_refusal(response: httpx.Response) -> bool:
+    """Recognize upstream replies that explicitly refuse work before execution."""
+    if response.status_code == 429:
+        return True
+    if response.status_code != 503:
+        return False
+    try:
+        payload = response.json()
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return isinstance(error, dict) and error.get("code") == "gateway_draining"
+    except (ValueError, AttributeError):
+        return False
+
+
+def _retry_before_submission(request_id: str, error: str, max_attempts: int = 4) -> bool:
+    """Retry transient failures only while no Hermes chat turn was submitted."""
+    now = time.time()
+    safe_error = _audit_redact(" ".join(str(error).split()), 500)
+    with closing(_connect()) as conn, conn:
+        row = conn.execute(
+            "SELECT attempts FROM requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        attempts = int(row["attempts"] or 0) if row is not None else max_attempts
+        if row is not None and attempts < max_attempts:
+            delay = min(2 ** attempts, 15)
+            conn.execute(
+                "UPDATE requests SET status='queued', error=?, next_attempt_at=?, "
+                "chat_submitted_at=NULL, updated_at=? "
+                "WHERE request_id=? AND status='processing'",
+                (f"Temporary Hermes API failure; retry {attempts}/{max_attempts} in {delay}s: {safe_error}",
+                 now + delay, now, request_id),
+            )
+            return True
+        conn.execute(
+            "UPDATE requests SET status='failed', error=?, next_attempt_at=NULL, updated_at=? "
+            "WHERE request_id=? AND status='processing'",
+            (f"Hermes API unavailable after {attempts} attempts: {safe_error}", now, request_id),
+        )
+        return False
+
+
+def _mark_chat_submitted(request_id: str) -> None:
+    """Persist the no-replay boundary before sending a chat turn to Hermes."""
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute(
+            "UPDATE requests SET chat_submitted_at=?, updated_at=? "
+            "WHERE request_id=? AND status='processing'",
+            (now, now, request_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Could not confirm durable submission marker; chat was not sent")
+
+
+def _mark_stale_uncertain() -> None:
+    """Recover abandoned work without replaying a possibly executed chat turn."""
+    now = time.time()
+    with closing(_connect()) as conn, conn:
+        # If the durable boundary was crossed, Hermes may already have executed it.
+        conn.execute(
+            "UPDATE requests SET status='uncertain', "
+            "error='Previous worker stopped after chat submission; inspect Hermes session before retrying', "
+            "updated_at=? WHERE status='processing' AND chat_submitted_at IS NOT NULL",
+            (now,),
+        )
+        # Work that stopped before the chat POST is safe to return to the queue.
+        conn.execute(
+            "UPDATE requests SET status='queued', attempts=MAX(attempts-1, 0), "
+            "error='Previous worker stopped before chat submission; safely requeued', "
+            "next_attempt_at=NULL, updated_at=? "
+            "WHERE status='processing' AND chat_submitted_at IS NULL",
+            (now,),
+        )
+
+
+async def _execute_request(request_id: str, message: str) -> None:
+    api_key = os.getenv("API_SERVER_KEY", "")
+    if not api_key:
+        await asyncio.to_thread(_finish, request_id, "failed", error="API server key missing")
+        return
+    chat_submitted = False
+    async with _LOCK:
+        try:
+            api_headers = {"Authorization": f"Bearer {api_key}"}
+            timeout = httpx.Timeout(900.0, connect=5.0, read=900.0, write=30.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                await _ensure_session(client, api_headers)
+                model_lock = await client.post(
+                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/model",
+                    headers=api_headers,
+                    json={"model": _CHANNEL_MODEL, "provider": _CHANNEL_PROVIDER},
+                )
+                if model_lock.status_code != 200:
+                    if model_lock.status_code == 429 or model_lock.status_code >= 500:
+                        await asyncio.to_thread(
+                            _retry_before_submission, request_id,
+                            f"Hermes model selection returned HTTP {model_lock.status_code}",
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            _finish, request_id, "failed",
+                            error=f"Hermes model selection returned HTTP {model_lock.status_code}",
+                            session_id=_SESSION_ID,
+                        )
+                    return
+                await asyncio.to_thread(_mark_chat_submitted, request_id)
+                chat_submitted = True
+                response = await client.post(
+                    f"{_API_BASE}/api/sessions/{_SESSION_ID}/chat",
+                    headers={**api_headers, "Idempotency-Key": request_id},
+                    json={"message": message, "system_message": _SYSTEM_MESSAGE},
+                )
+            if response.status_code != 200:
+                detail = _audit_redact(" ".join((response.text or "").split()), 800)
+                if _retryable_admission_refusal(response):
+                    await asyncio.to_thread(
+                        _retry_before_submission, request_id,
+                        f"Hermes API declined admission with HTTP {response.status_code}: {detail}",
+                    )
+                else:
+                    outcome = "uncertain" if response.status_code >= 500 else "failed"
+                    await asyncio.to_thread(
+                        _finish, request_id, outcome,
+                        error=f"Hermes API returned HTTP {response.status_code}: {detail}",
+                        session_id=_SESSION_ID,
+                    )
+                return
+            try:
+                result = response.json()
+            except ValueError:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error="Hermes API returned unreadable JSON after accepting the chat request",
+                    session_id=_SESSION_ID,
+                )
+                return
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Unexpected Hermes API response type: {type(result).__name__}")
+            state = result.get("status")
+            message_obj = result.get("message", {})
+            if isinstance(message_obj, dict):
+                content = message_obj.get("content", "")
+            elif isinstance(message_obj, str):
+                content = message_obj
+            else:
+                content = result.get("reply", "")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            if state != "completed":
+                outcome = "failed" if state == "failed" else "uncertain"
+                await asyncio.to_thread(
+                    _finish, request_id, outcome, reply=content,
+                    error=f"Hermes turn did not confirm completion (status={state!r})",
+                    session_id=_SESSION_ID,
+                )
+                return
+            await asyncio.to_thread(
+                _finish, request_id, "completed", reply=content, session_id=_SESSION_ID,
+            )
+        except asyncio.CancelledError:
+            if chat_submitted:
+                await asyncio.shield(asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error="Relay worker stopped during execution; inspect Hermes session before retrying",
+                    session_id=_SESSION_ID,
+                ))
+            else:
+                await asyncio.shield(asyncio.to_thread(
+                    _release_unsubmitted, request_id,
+                    "Relay worker stopped before submitting the Hermes chat request",
+                ))
+            raise
+        except _TransientApiError as exc:
+            await asyncio.to_thread(_retry_before_submission, request_id, str(exc))
+        except httpx.TimeoutException:
+            if chat_submitted:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error="Hermes API exceeded 900 seconds; inspect session history before retrying",
+                    session_id=_SESSION_ID,
+                )
+            else:
+                await asyncio.to_thread(
+                    _retry_before_submission, request_id, "Hermes API timed out before chat submission"
+                )
+        except httpx.ConnectError as exc:
+            if chat_submitted:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error=f"Hermes API connection failed ({type(exc).__name__}); inspect session before retrying",
+                    session_id=_SESSION_ID,
+                )
+            else:
+                await asyncio.to_thread(
+                    _retry_before_submission, request_id, "Could not connect to the local Hermes API server"
+                )
+        except httpx.HTTPError as exc:
+            if chat_submitted:
+                await asyncio.to_thread(
+                    _finish, request_id, "uncertain",
+                    error=f"Hermes API connection failed ({type(exc).__name__}); inspect session before retrying",
+                    session_id=_SESSION_ID,
+                )
+            else:
+                await asyncio.to_thread(
+                    _retry_before_submission, request_id,
+                    f"Local Hermes API failed before chat submission ({type(exc).__name__})",
+                )
+        except Exception as exc:
+            detail = " ".join(str(exc).split())[:400]
+            detail = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._-]+", r"\1[redacted]", detail)
+            detail = re.sub(r"(?i)(api[_-]?key[=: ]+)[^\s,;]+", r"\1[redacted]", detail)
+            outcome = "uncertain" if chat_submitted else "failed"
+            await asyncio.to_thread(
+                _finish, request_id, outcome,
+                error=f"Hermes relay worker failed: {type(exc).__name__}: {detail}",
+                session_id=_SESSION_ID,
+            )
+
+
+async def _worker_loop() -> None:
+    try:
+        await asyncio.to_thread(_mark_stale_uncertain)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOG.exception("Hermes channel startup recovery failed; worker will keep retrying")
+    while not _STOP_EVENT.is_set():
+        try:
+            item = await asyncio.to_thread(_claim_next)
+            if item is not None:
+                request_id, message = item
+                await _execute_request(request_id, message)
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOG.exception("Hermes channel queue read failed; worker remains alive")
+        _WAKE_EVENT.clear()
+        try:
+            await asyncio.wait_for(_WAKE_EVENT.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def start_worker() -> None:
+    global _WORKER_TASK, _WAKE_EVENT, _STOP_EVENT, _LOCK
+    if _WORKER_TASK is None or _WORKER_TASK.done():
+        # Synchronization objects belong to the active ASGI event loop.
+        # Recreate them so app restarts cannot reuse a closed loop.
+        _LOCK = asyncio.Lock()
+        _WAKE_EVENT = asyncio.Event()
+        _STOP_EVENT = asyncio.Event()
+        _WORKER_TASK = asyncio.create_task(_worker_loop(), name="hermes-channel-worker")
+
+
+async def stop_worker() -> None:
+    global _WORKER_TASK
+    _STOP_EVENT.set()
+    _WAKE_EVENT.set()
+    if _WORKER_TASK is not None:
+        task = _WORKER_TASK
+        try:
+            await asyncio.wait_for(task, timeout=_WORKER_STOP_TIMEOUT)
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError:
+            # Do not swallow cancellation of the ASGI shutdown itself.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            # A worker cancelled by the shutdown timeout propagates cancellation
+            # through its active request after recording a safe receipt.
+            if not task.cancelled():
+                raise
+        finally:
+            if task.done() or task.cancelled():
+                _WORKER_TASK = None
+
+
+async def chat(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 65536):
+        return _error("Request body too large", 413)
+    try:
+        raw = await request.body()
+        if len(raw) > 65536:
+            return _error("Request body too large", 413)
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict):
+        return _error("Expected a JSON object", 400)
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return _error("message must be a non-empty string", 400)
+    if len(message) > 20000:
+        return _error("message exceeds the 20000 character limit", 413)
+    request_id = request.headers.get("idempotency-key") or payload.get("request_id")
+    if request_id is None:
+        request_id = "cgpt-" + os.urandom(16).hex()
+    if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
+        return _error("request_id must contain 1-128 safe characters", 400)
+    input_sha256 = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    reservation, existing = await asyncio.to_thread(_reserve, request_id, input_sha256, message)
+    if reservation == "conflict":
+        return _error("request_id was already used with a different message", 409)
+    if reservation == "existing" and existing is not None:
+        if existing["status"] == "completed":
+            return JSONResponse(
+                {"ok": True, "status": "completed", "request_id": request_id,
+                 "session_id": existing["session_id"] or _SESSION_ID,
+                 "reply": existing["reply"] or "", "replayed": True},
+                headers={"Cache-Control": "no-store"},
+            )
+        if existing["status"] in ("queued", "processing"):
+            return JSONResponse(
+                {"ok": True, "status": existing["status"], "request_id": request_id,
+                 "session_id": existing["session_id"] or _SESSION_ID},
+                status_code=202, headers={"Cache-Control": "no-store"},
+            )
+        return _error(existing["error"] or "Previous request is not safe to replay", 409)
+    if _WORKER_TASK is None or _WORKER_TASK.done():
+        await start_worker()
+    _WAKE_EVENT.set()
+    return JSONResponse(
+        {"ok": True, "status": "queued", "request_id": request_id, "session_id": _SESSION_ID},
+        status_code=202, headers={"Cache-Control": "no-store"},
+    )
+
+
+async def post_outbox(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    length = request.headers.get("content-length")
+    if length and (not length.isdigit() or int(length) > 65536):
+        return _error("Request body too large", 413)
+    try:
+        raw = await request.body()
+        if len(raw) > 65536:
+            return _error("Request body too large", 413)
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("Expected a JSON request body", 400)
+    if not isinstance(payload, dict):
+        return _error("Expected a JSON object", 400)
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip() or len(message) > 20000:
+        return _error("message must be 1-20000 characters", 400)
+    message_id = payload.get("message_id") or ("hermes-" + os.urandom(16).hex())
+    if not isinstance(message_id, str) or not _REQUEST_ID_RE.fullmatch(message_id):
+        return _error("message_id must contain 1-128 safe characters", 400)
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO outbox(message_id,message,created_at) VALUES(?,?,?)",
+            (message_id, message, time.time()),
+        )
+        row = conn.execute("SELECT message FROM outbox WHERE message_id=?", (message_id,)).fetchone()
+    if row is None or row["message"] != message:
+        return _error("message_id already exists with different content", 409)
+    return JSONResponse({"ok": True, "message_id": message_id, "status": "stored"},
+                        status_code=201, headers={"Cache-Control": "no-store"})
+
+
+async def get_outbox(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "50"))))
+    except ValueError:
+        return _error("limit must be an integer", 400)
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT message_id,message,created_at FROM outbox WHERE acked_at IS NULL "
+            "ORDER BY created_at LIMIT ?", (limit,)
+        ).fetchall()
+    return JSONResponse({"ok": True, "messages": [dict(row) for row in rows]},
+                        headers={"Cache-Control": "no-store"})
+
+
+async def ack_outbox(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    message_id = request.path_params.get("message_id", "")
+    if not isinstance(message_id, str) or not _REQUEST_ID_RE.fullmatch(message_id):
+        return _error("Invalid message_id", 400)
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute(
+            "UPDATE outbox SET acked_at=? WHERE message_id=? AND acked_at IS NULL",
+            (time.time(), message_id),
+        )
+    return JSONResponse({"ok": True, "acked": cur.rowcount == 1, "message_id": message_id},
+                        headers={"Cache-Control": "no-store"})
+
+
+async def get_request(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _error("Unauthorized", 401)
+    request_id = request.path_params.get("request_id", "")
+    if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
+        return _error("Invalid request_id", 400)
+    with closing(_connect()) as conn, conn:
+        row = conn.execute(
+            "SELECT request_id, status, reply, error, session_id, created_at, updated_at "
+            "FROM requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+    if row is None:
+        return _error("Request not found", 404)
+    return JSONResponse({"ok": row["status"] == "completed", **dict(row)},
+                        headers={"Cache-Control": "no-store"})

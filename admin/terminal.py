@@ -28,6 +28,8 @@ from pathlib import Path
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from .security import same_origin
+
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/data"))
 HERMES_BIN = "/opt/hermes/.venv/bin/hermes"
@@ -74,7 +76,8 @@ async def login_ws(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
-    await _bridge(websocket, argv, run_heal_on_success=True)
+    provider_hint = provider if provider in ALLOWED_PROVIDERS else None
+    await _bridge(websocket, argv, run_heal_on_success=True, provider_hint=provider_hint)
 
 
 async def shell_ws(websocket: WebSocket) -> None:
@@ -87,13 +90,11 @@ async def shell_ws(websocket: WebSocket) -> None:
 
 
 async def _check_auth(websocket: WebSocket) -> bool:
-    """Validate the hermes_session cookie by hitting an authenticated WebUI endpoint.
-
-    hermes-webui has no dedicated /api/auth/check, so we probe /api/onboarding/status
-    which (a) requires auth when a password is configured and (b) is cheap.
-    """
+    """Validate same-origin browser access and the authenticated WebUI session."""
     import httpx
 
+    if not same_origin(websocket.headers):
+        return False
     cookie_header = websocket.headers.get("cookie", "")
     if not cookie_header:
         return False
@@ -107,7 +108,7 @@ async def _check_auth(websocket: WebSocket) -> bool:
                 headers={"cookie": cookie_header, "host": f"{proxy.WEBUI_HOST}:{proxy.WEBUI_PORT}"},
             )
         return r.status_code == 200
-    except (httpx.ConnectError, httpx.ReadTimeout):
+    except httpx.HTTPError:
         return False
 
 
@@ -126,11 +127,12 @@ _PROVIDER_DEFAULT_MODEL = {
 }
 
 
-def _post_auth_heal_and_restart() -> str:
-    """After a successful auth/model command, normalize state and restart hermes-webui.
+def _post_auth_heal_and_restart(provider_hint: str | None = None) -> str:
+    """After a successful OAuth/model command, normalize state and restart hermes-webui.
 
-    1. If config.yaml lacks model.provider but auth.json has a known OAuth credential,
-       set model.provider + base_url so the agent can find credentials.
+    1. For an explicit OAuth shortcut, select that authenticated provider as the
+       active model provider (and its subscription default). Otherwise, fill a
+       missing model.provider from auth.json without overriding user selection.
     2. Backfill stale `model: <other-provider>/<x>` and missing model_provider on
        webui sessions (and the _index.json cache).
     3. Delete the catalog cache file so the next webui process rebuilds fresh.
@@ -177,18 +179,45 @@ def _post_auth_heal_and_restart() -> str:
                 model_cfg = cfg.get("model")
                 if not isinstance(model_cfg, dict):
                     model_cfg = {}
-                if not model_cfg.get("provider"):
+                explicit_provider = provider_hint if provider_hint in authed else None
+                previous_provider = model_cfg.get("provider")
+                changed = False
+
+                if explicit_provider:
+                    # Clicking an OAuth shortcut is an explicit provider choice.
+                    # Do not leave an older API-key provider active after Codex login.
+                    chosen_provider = explicit_provider
+                    if model_cfg.get("provider") != chosen_provider:
+                        model_cfg["provider"] = chosen_provider
+                        model_cfg["default"] = _PROVIDER_DEFAULT_MODEL[chosen_provider]
+                        changed = True
+                    if model_cfg.get("base_url") != _PROVIDER_BASE[chosen_provider]:
+                        model_cfg["base_url"] = _PROVIDER_BASE[chosen_provider]
+                        changed = True
+                    if not model_cfg.get("default") and chosen_provider in _PROVIDER_DEFAULT_MODEL:
+                        model_cfg["default"] = _PROVIDER_DEFAULT_MODEL[chosen_provider]
+                        changed = True
+                elif not model_cfg.get("provider"):
                     chosen_provider = authed[0]
                     model_cfg["provider"] = chosen_provider
                     if not model_cfg.get("base_url"):
                         model_cfg["base_url"] = _PROVIDER_BASE[chosen_provider]
                     if not model_cfg.get("default") and chosen_provider in _PROVIDER_DEFAULT_MODEL:
                         model_cfg["default"] = _PROVIDER_DEFAULT_MODEL[chosen_provider]
-                    cfg["model"] = model_cfg
-                    yaml.safe_dump(cfg, cfg_p.open("w", encoding="utf-8"), sort_keys=False)
-                    notes.append(f"wrote config.yaml: model.provider={chosen_provider}, default={model_cfg.get('default')!r}")
+                    changed = True
                 else:
                     chosen_provider = model_cfg["provider"]
+
+                if changed:
+                    cfg["model"] = model_cfg
+                    yaml.safe_dump(cfg, cfg_p.open("w", encoding="utf-8"), sort_keys=False)
+                    notes.append(
+                        f"selected OAuth provider={chosen_provider}, default={model_cfg.get('default')!r}"
+                        if explicit_provider
+                        else f"wrote config.yaml: model.provider={chosen_provider}, default={model_cfg.get('default')!r}"
+                    )
+                elif explicit_provider and previous_provider == chosen_provider:
+                    notes.append(f"OAuth provider already active: {chosen_provider}")
         except Exception as exc:
             notes.append(f"config heal failed: {exc!r}")
 
@@ -200,6 +229,10 @@ def _post_auth_heal_and_restart() -> str:
             default_model = (mc.get("default") or "").strip()
             default_provider = (mc.get("provider") or "").strip()
             if default_model and default_provider:
+                # An explicit OAuth shortcut is a global provider choice.
+                # Move existing session defaults too, so reopening an old session
+                # cannot silently keep using the previous billable API provider.
+                force_session_provider = bool(provider_hint and provider_hint == default_provider)
                 sessions_dir = home / ".hermes" / "webui" / "sessions"
                 patched = 0
                 if sessions_dir.exists():
@@ -213,7 +246,7 @@ def _post_auth_heal_and_restart() -> str:
                         if not isinstance(s, dict):
                             continue
                         m = s.get("model") or ""
-                        if not s.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
+                        if force_session_provider or not s.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
                             s["model"] = default_model
                             s["model_provider"] = default_provider
                             sf.write_text(json.dumps(s), encoding="utf-8")
@@ -226,7 +259,7 @@ def _post_auth_heal_and_restart() -> str:
                             if not isinstance(e, dict):
                                 continue
                             m = e.get("model") or ""
-                            if not e.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
+                            if force_session_provider or not e.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
                                 e["model"] = default_model
                                 e["model_provider"] = default_provider
                         idx_p.write_text(json.dumps(idx), encoding="utf-8")
@@ -288,7 +321,13 @@ def _post_auth_heal_and_restart() -> str:
     return "; ".join(notes) if notes else "no-op (nothing to heal)"
 
 
-async def _bridge(ws: WebSocket, argv: list[str], *, run_heal_on_success: bool) -> None:
+async def _bridge(
+    ws: WebSocket,
+    argv: list[str],
+    *,
+    run_heal_on_success: bool,
+    provider_hint: str | None = None,
+) -> None:
     from ptyprocess import PtyProcessUnicode  # type: ignore
 
     cwd = str(HERMES_HOME)
@@ -377,9 +416,11 @@ async def _bridge(ws: WebSocket, argv: list[str], *, run_heal_on_success: bool) 
         except Exception:
             pass
 
-        for task in (writer_task, reader_task):
-            if not task.done():
-                task.cancel()
+        pending_tasks = [task for task in (writer_task, reader_task) if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         # On clean exit of an OAuth one-shot, normalize state and trigger a
         # webui restart so the user sees a fresh catalog/sessions on the next
@@ -389,7 +430,7 @@ async def _bridge(ws: WebSocket, argv: list[str], *, run_heal_on_success: bool) 
         if run_heal_on_success and exit_code == 0:
             try:
                 heal_note = await asyncio.get_running_loop().run_in_executor(
-                    None, _post_auth_heal_and_restart
+                    None, _post_auth_heal_and_restart, provider_hint
                 )
             except Exception as exc:
                 heal_note = f"heal raised: {exc!r}"

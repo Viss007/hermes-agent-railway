@@ -1,30 +1,11 @@
 """Thin Starlette wrapper in front of hermes-webui.
 
-Adds one new surface — `/tui` — that exposes an in-browser xterm with two modes:
-  - OAuth one-shots: `hermes auth add <X> --type oauth --no-browser` for Codex /
-    Nous Portal device-code flows (`/tui/ws/auth/<provider>`).
-  - Free-form shell: `/bin/bash -i` for users without SSH access who need to
-    run other `hermes` CLI commands or peek at `/data` (`/tui/ws/shell`).
-
-Hermes CLI ``hermes dashboard`` is reverse-proxied under ``/hermes-dashboard`` by default
-(override with ``HERMES_DASHBOARD_MOUNT_PATH`` — see ``admin/dashboard_proxy.py``): loopback port
-9119 (``HERMES_DASHBOARD_HOST`` / ``HERMES_DASHBOARD_PORT``) with ``X-Forwarded-Prefix`` so
-upstream rewrites SPA asset URLs correctly.
-
-Every other path is reverse-proxied to hermes-webui on loopback
-(``HERMES_WEBUI_HOST`` / ``HERMES_WEBUI_PORT``, default ``127.0.0.1:9120``),
-including WebSockets and SSE chat streams.
-
-This wrapper does NOT enforce separate auth on traffic proxied to hermes-webui; that app
-handles its password gate via session cookies / `/login`.
-
-The **`/tui`** page probes hermes-webui's API cookies before responding; **`/hermes-dashboard`** runs
-Hermes upstream's CLI dashboard and does **not** use **`ADMIN_PASSWORD`**. Whenever **`hermes dashboard`** is
-listening it can expose **`.env`** — minimize uptime on public Railway URLs unless you acknowledge that risk (see upstream [**Web Dashboard**](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard) docs).
+Adds an in-browser xterm at /tui and a narrow authenticated ChatGPT relay.
+All ordinary WebUI paths remain reverse-proxied to hermes-webui.
 """
-
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -34,6 +15,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 
 from . import proxy as hermes_proxy
 from . import terminal as hermes_terminal
+from . import channel as chatgpt_channel
 from .dashboard_proxy import DASHBOARD_MOUNT_PREFIX, build_dashboard_starlette_app
 
 
@@ -41,11 +23,7 @@ TEMPLATE_PATH = Path(__file__).parent / "templates" / "tui.html"
 
 
 async def _is_authenticated(request: Request) -> bool:
-    """Cheap auth probe: hit hermes-webui's /api/onboarding/status with the user's cookies.
-
-    First call after boot can be slow (5+s) due to hermes_cli imports inside the
-    webui server. Use a generous timeout — auth checks are infrequent.
-    """
+    """Probe hermes-webui's onboarding API using the user's session cookie."""
     import httpx
 
     cookie = request.headers.get("cookie", "")
@@ -58,7 +36,7 @@ async def _is_authenticated(request: Request) -> bool:
                 headers={"cookie": cookie, "host": f"{hermes_proxy.WEBUI_HOST}:{hermes_proxy.WEBUI_PORT}"},
             )
         return r.status_code == 200
-    except (httpx.ConnectError, httpx.ReadTimeout):
+    except httpx.HTTPError:
         return False
 
 
@@ -70,15 +48,38 @@ async def tui_page(request: Request):
 
 routes = [
     Route("/tui", tui_page, methods=["GET"]),
+    Route("/agent-channel/health", chatgpt_channel.health, methods=["GET"]),
+    Route("/agent-channel/capabilities", chatgpt_channel.capabilities, methods=["GET"]),
+    Route("/agent-channel/toolsets", chatgpt_channel.toolsets, methods=["GET"]),
+    Route("/agent-channel/skills", chatgpt_channel.skills, methods=["GET"]),
+    Route("/agent-channel/models", chatgpt_channel.models, methods=["GET"]),
+    Route("/agent-channel/model-options", chatgpt_channel.model_options, methods=["GET"]),
+    Route("/agent-channel/session", chatgpt_channel.current_session, methods=["GET"]),
+    Route("/agent-channel/model-test", chatgpt_channel.model_test, methods=["POST"]),
+    Route("/agent-channel/diagnostics", chatgpt_channel.diagnostics, methods=["GET"]),
+    Route("/agent-channel/ui-audit", chatgpt_channel.ui_audit, methods=["GET"]),
+    Route("/agent-channel/configure-primary", chatgpt_channel.configure_primary, methods=["POST"]),
+    Route("/agent-channel/chat", chatgpt_channel.chat, methods=["POST"]),
+    Route("/agent-channel/requests/{request_id}", chatgpt_channel.get_request, methods=["GET"]),
+    Route("/agent-channel/outbox", chatgpt_channel.get_outbox, methods=["GET"]),
+    Route("/agent-channel/outbox", chatgpt_channel.post_outbox, methods=["POST"]),
+    Route("/agent-channel/outbox/{message_id}/ack", chatgpt_channel.ack_outbox, methods=["POST"]),
     WebSocketRoute("/tui/ws/auth/{provider}", hermes_terminal.login_ws),
     WebSocketRoute("/tui/ws/shell", hermes_terminal.shell_ws),
     Mount(DASHBOARD_MOUNT_PREFIX, build_dashboard_starlette_app()),
-    # Catch-all proxy for everything else (HTTP + WebSocket).
+    # Catch-all proxy for every other path (HTTP + WebSocket).
     WebSocketRoute("/{path:path}", hermes_proxy.ws_proxy),
     Route("/{path:path}", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
-    # Root path needs its own route — Starlette's path converter requires at least one segment.
     Route("/", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
 ]
 
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    await chatgpt_channel.start_worker()
+    try:
+        yield
+    finally:
+        await chatgpt_channel.stop_worker()
 
-app = Starlette(debug=False, routes=routes)
+
+app = Starlette(debug=False, routes=routes, lifespan=lifespan)

@@ -88,8 +88,21 @@ print("[entrypoint] reset onboarding_completed (no .env, no OAuth)")
 PY
 fi
 
-if [ ! -f "${HERMES_HOME}/SOUL.md" ] && [ -f "/opt/hermes/docker/SOUL.md" ]; then
-  cp /opt/hermes/docker/SOUL.md "${HERMES_HOME}/SOUL.md"
+# Seed the Viss operator identity and user profile only on a fresh volume.
+# Never overwrite existing identity or memory files on redeploy.
+if [ ! -e "${HERMES_HOME}/SOUL.md" ]; then
+  if [ -s "/opt/hermes-railway/profile/SOUL.md" ]; then
+    cp /opt/hermes-railway/profile/SOUL.md "${HERMES_HOME}/SOUL.md"
+    echo "[entrypoint] seeded primary-operator SOUL.md"
+  elif [ -f "/opt/hermes/docker/SOUL.md" ]; then
+    cp /opt/hermes/docker/SOUL.md "${HERMES_HOME}/SOUL.md"
+  fi
+fi
+
+USER_MEMORY_FILE="${HERMES_HOME}/memories/USER.md"
+if [ ! -e "${USER_MEMORY_FILE}" ] && [ -s "/opt/hermes-railway/profile/memories/USER.md" ]; then
+  cp /opt/hermes-railway/profile/memories/USER.md "${USER_MEMORY_FILE}"
+  echo "[entrypoint] seeded initial USER.md"
 fi
 
 # Self-heal: hermes-webui caches its model catalog at this path for 24 hours.
@@ -118,7 +131,7 @@ PROVIDER_BASE = {
     "nous": "https://inference-api.nousresearch.com/v1",
 }
 PROVIDER_DEFAULT_MODEL = {
-    "openai-codex": "gpt-5.5",
+    "openai-codex": "gpt-6-luna",
     "nous": "Hermes-3-Llama-3.1-70B-FP8",
 }
 
@@ -158,6 +171,87 @@ print(f"[entrypoint] wrote config.yaml: model.provider={chosen}, default={model_
 PY
 fi
 
+# GPT-5.5 retired for ChatGPT-authenticated Codex on 2026-10-14.
+# Migrate only this exact retired default for the openai-codex provider.
+# Keep a one-time backup of the user's original config before changing it.
+if [ -f "${HERMES_HOME}/config.yaml" ]; then
+  python3 - <<PY || true
+import os, pathlib, shutil, yaml
+p = pathlib.Path("${HERMES_HOME}/config.yaml")
+try:
+    cfg = yaml.safe_load(p.read_text()) or {}
+    model = cfg.get("model") or {}
+    if model.get("provider") == "openai-codex" and model.get("default") == "gpt-5.5":
+        backup = p.with_name("config.yaml.pre-gpt55-retirement.bak")
+        if not backup.exists():
+            shutil.copy2(p, backup)
+            os.chmod(backup, 0o600)
+        model["default"] = "gpt-6-luna"
+        cfg["model"] = model
+        tmp = p.with_name("config.yaml.retirement.tmp")
+        tmp.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+        print("[entrypoint] migrated openai-codex default gpt-5.5 -> gpt-6-luna (backup retained)")
+except Exception as exc:
+    print(f"[entrypoint] Codex model migration skipped: {type(exc).__name__}")
+PY
+fi
+
+
+
+
+# One-time primary-agent handover. The selected OpenAI-compatible models
+# passed isolated terminal-tool acceptance via the configured OpenAI API
+# provider. Keep the original config backup and preserve unrelated settings.
+PRIMARY_MARKER="${HERMES_HOME}/.hermes/primary-agent-config-v1.json"
+if [ -f "${HERMES_HOME}/config.yaml" ] && [ ! -f "${PRIMARY_MARKER}" ]; then
+  python3 - <<PY
+import json, os, pathlib, shutil, yaml
+home = pathlib.Path("${HERMES_HOME}")
+config = home / "config.yaml"
+backup = home / "config.yaml.pre-primary-agent.bak"
+marker = pathlib.Path("${PRIMARY_MARKER}")
+cfg = yaml.safe_load(config.read_text()) or {}
+if not isinstance(cfg, dict):
+    raise SystemExit("config.yaml root is not a mapping")
+if not backup.exists():
+    shutil.copy2(config, backup)
+    os.chmod(backup, 0o600)
+model = cfg.setdefault("model", {})
+if not isinstance(model, dict):
+    raise SystemExit("config.yaml model section is not a mapping")
+base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+model["provider"] = "openai-api"
+model["default"] = "deepseek-v4.1-flash-uncensored"
+if base_url:
+    model["base_url"] = base_url
+servers = cfg.get("mcp_servers")
+disabled = []
+if isinstance(servers, dict):
+    for name in ("desktop-commander", "cuebank"):
+        item = servers.get(name)
+        if isinstance(item, dict):
+            item["enabled"] = False
+            disabled.append(name)
+tmp = config.with_name("config.yaml.primary-agent.tmp")
+tmp.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+os.chmod(tmp, 0o600)
+os.replace(tmp, config)
+marker.parent.mkdir(parents=True, exist_ok=True)
+marker.write_text(json.dumps({
+    "version": 1,
+    "provider": model["provider"],
+    "model": model["default"],
+    "disabled_mcp_servers": disabled,
+}, indent=2))
+os.chmod(marker, 0o600)
+os.chmod(config, 0o600)
+print("[entrypoint] primary-agent config applied: provider=openai-api, model=deepseek-v4.1-flash-uncensored")
+print("[entrypoint] disabled offline/unwanted MCP servers: " + ", ".join(disabled))
+PY
+fi
+
 # Self-heal: backfill stale `model: <other-provider>/<name>` and missing
 # model_provider on existing webui sessions, so users don't hit "No LLM
 # provider configured" when reopening sessions created before they configured
@@ -186,6 +280,7 @@ for p in glob.glob("${SESSIONS_DIR}/*.json"):
     needs_fix = (
         not s.get("model_provider")
         or ("/" in m and not m.startswith(default_provider + "/"))
+        or (default_provider == "openai-codex" and m == "gpt-5.5")
     )
     if needs_fix:
         s["model"] = default_model
@@ -202,7 +297,9 @@ if idx_p.exists():
             if not isinstance(e, dict):
                 continue
             m = e.get("model") or ""
-            if not e.get("model_provider") or ("/" in m and not m.startswith(default_provider + "/")):
+            if (not e.get("model_provider")
+                or ("/" in m and not m.startswith(default_provider + "/"))
+                or (default_provider == "openai-codex" and m == "gpt-5.5")):
                 e["model"] = default_model
                 e["model_provider"] = default_provider
                 idx_patched += 1
@@ -262,17 +359,194 @@ export HERMES_WEBUI_AGENT_DIR="/opt/hermes"
 if [ "${START_GATEWAY:-false}" = "true" ]; then
   GATEWAY_LOG="${HERMES_HOME}/logs/gateway.log"
   GATEWAY_PID_FILE="${HERMES_HOME}/gateway.pid"
-  echo "Starting Hermes messaging gateway in background..."
-  printf '\n--- Starting Hermes gateway %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
-  if [ "$(id -u)" = "0" ]; then
-    setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
-      >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+  WHATSAPP_SESSION_DIR="${HERMES_HOME}/platforms/whatsapp/session"
+  PAIRING_STATE_DIR="${HERMES_HOME}/platforms/whatsapp/pairing-session"
+  PAIRING_COMPLETE_FILE="${HERMES_HOME}/platforms/whatsapp/.phone-pairing-complete"
+  if [ -s "${WHATSAPP_SESSION_DIR}/creds.json" ]; then
+    CREDS_BYTES=$(wc -c < "${WHATSAPP_SESSION_DIR}/creds.json" | tr -d ' ')
+    echo "[whatsapp-session-check] existing_credentials=present bytes=${CREDS_BYTES} pairing=disabled"
   else
-    setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
-      >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    echo "[whatsapp-session-check] existing_credentials=missing pairing=disabled"
   fi
-  echo $! > "${GATEWAY_PID_FILE}"
-  echo "Gateway PID: $(cat "${GATEWAY_PID_FILE}") (logs at ${GATEWAY_LOG})"
+  # This device is already linked as Google Chrome (Ubuntu). Never start a new pairing flow.
+  PAIRING_PHONE=""
+
+  start_hermes_gateway() {
+    printf '\n--- Starting Hermes gateway %s ---\n' "$(date)" >> "${GATEWAY_LOG}"
+    if [ "$(id -u)" = "0" ]; then
+      setsid gosu hermes /opt/hermes/.venv/bin/hermes gateway run --replace \
+        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    else
+      setsid /opt/hermes/.venv/bin/hermes gateway run --replace \
+        >> "${GATEWAY_LOG}" 2>&1 < /dev/null &
+    fi
+    GW_PID=$!
+    echo "${GW_PID}" > "${GATEWAY_PID_FILE}"
+    echo "Gateway PID: ${GW_PID} (logs at ${GATEWAY_LOG})"
+  }
+
+  if [ -n "${PAIRING_PHONE}" ] && [ ! -f "${PAIRING_COMPLETE_FILE}" ]; then
+    echo "Starting Hermes gateway before WhatsApp pairing; API/UI remain available while WhatsApp is unpaired."
+    # The gateway owns the local API server used by the WebUI's authenticated
+    # operator channel. Do not hold that server hostage to interactive pairing.
+    start_hermes_gateway
+
+    echo "Starting fresh WhatsApp phone-number pairing in isolated session state..."
+    mkdir -p "$(dirname "${WHATSAPP_SESSION_DIR}")"
+    rm -rf "${PAIRING_STATE_DIR}"
+    mkdir -p "${PAIRING_STATE_DIR}"
+    if [ "$(id -u)" = "0" ]; then
+      chown hermes:hermes "${PAIRING_STATE_DIR}"
+    fi
+    (
+      set +e
+      if [ "$(id -u)" = "0" ]; then
+        gosu hermes env WHATSAPP_PAIRING_PHONE_NUMBER="${PAIRING_PHONE}" node \
+          /opt/hermes/scripts/whatsapp-bridge/bridge.js --pair-only --pair-json \
+          --session "${PAIRING_STATE_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
+        PAIR_RC=$?
+      else
+        WHATSAPP_PAIRING_PHONE_NUMBER="${PAIRING_PHONE}" node \
+          /opt/hermes/scripts/whatsapp-bridge/bridge.js --pair-only --pair-json \
+          --session "${PAIRING_STATE_DIR}" --mode "${WHATSAPP_MODE:-self-chat}"
+        PAIR_RC=$?
+      fi
+      if [ "${PAIR_RC}" -eq 0 ] && [ -s "${PAIRING_STATE_DIR}/creds.json" ]; then
+        if [ -d "${WHATSAPP_SESSION_DIR}" ]; then
+          mv "${WHATSAPP_SESSION_DIR}" "${WHATSAPP_SESSION_DIR}.pre-pair-backup-$(date +%s)"
+        fi
+        mv "${PAIRING_STATE_DIR}" "${WHATSAPP_SESSION_DIR}"
+        touch "${PAIRING_COMPLETE_FILE}"
+        if [ "$(id -u)" = "0" ]; then
+          chown -R hermes:hermes "${WHATSAPP_SESSION_DIR}" "${PAIRING_COMPLETE_FILE}"
+        fi
+        echo "WhatsApp phone pairing completed; authenticated session installed."
+        # Replace the degraded gateway so the WhatsApp adapter loads the new
+        # credentials. --replace handles the existing gateway process safely.
+        start_hermes_gateway
+      else
+        echo "WhatsApp phone pairing is not complete (exit ${PAIR_RC}); gateway stays online in degraded mode so the API and UI remain available."
+      fi
+    ) &
+  else
+    echo "Starting Hermes messaging gateway in background..."
+    start_hermes_gateway
+  fi
+
+  # Verify the existing linked device and read-only chat access. No message
+  # bodies, chat names, JIDs or phone numbers are emitted to Railway logs.
+  if [ "${WHATSAPP_ENABLED:-false}" = "true" ]; then
+    nohup python3 - <<'PY' >/proc/1/fd/1 2>&1 &
+import json, time, urllib.request, urllib.parse, re
+BASE = "http://127.0.0.1:3000"
+def get(path, timeout=15):
+    req = urllib.request.Request(BASE + path, headers={"Accept": "application/json"}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.load(response)
+def safe_status(status):
+    batch = status.get("lastHistoryBatch") or {}
+    return {
+        "connection": status.get("connection", "unknown"),
+        "credentials": "present" if status.get("credentialsPresent") else "missing",
+        "read_receipts": "disabled" if status.get("sendReadReceipts") is False else "UNVERIFIED",
+        "outbound_writes": "blocked" if status.get("readOnly") else "UNVERIFIED",
+        "disconnect_reason": status.get("lastDisconnectReason"),
+        "history_bootstrap": status.get("historyBootstrapStatus", "unknown"),
+        "history_batches": status.get("historyBatchCount", 0),
+        "last_batch_chats": batch.get("chats", 0),
+        "last_batch_messages": batch.get("messages", 0),
+        "cached_chats": status.get("cachedChats", 0),
+        "cached_messages": status.get("cachedMessages", 0),
+        "bridge_events": status.get("bridgeEventCounts", {}),
+    "history_bootstrap": status.get("historyBootstrapStatus", "unknown"),
+    }
+last = None
+status = None
+connect_deadline = time.monotonic() + 180
+while time.monotonic() < connect_deadline:
+    try:
+        status = get("/status")
+        snap = safe_status(status)
+        if snap != last:
+            print("[whatsapp-readonly-status] " + json.dumps(snap, sort_keys=True), flush=True)
+            last = snap
+        if status.get("connection") == "linked":
+            break
+    except Exception as exc:
+        kind = type(exc).__name__
+        if kind != last:
+            print("[whatsapp-readonly-status] bridge_probe=" + kind, flush=True)
+            last = kind
+    time.sleep(3)
+if not status or status.get("connection") != "linked":
+    try:
+        status = get("/status")
+        print("[whatsapp-readonly-final] " + json.dumps(safe_status(status), sort_keys=True), flush=True)
+    except Exception as exc:
+        print("[whatsapp-readonly-final] bridge_unavailable=" + type(exc).__name__, flush=True)
+    raise SystemExit(0)
+# Allow the already-linked device to finish its read-only app-state and history sync.
+print("[whatsapp-readonly-test] linked_device_confirmed=1", flush=True)
+sync_deadline = time.monotonic() + 120
+while time.monotonic() < sync_deadline:
+    try:
+        status = get("/status")
+        if int(status.get("cachedMessages") or 0) > 0:
+            break
+    except Exception:
+        pass
+    time.sleep(3)
+history_deadline = time.monotonic() + 90
+while time.monotonic() < history_deadline:
+    try:
+        status = get("/status")
+        if int(status.get("cachedMessages") or 0) > 0:
+            break
+    except Exception:
+        pass
+    time.sleep(5)
+print("[whatsapp-readonly-test] history_wait_finished=1", flush=True)
+chats = get("/chats?limit=120").get("chats", [])
+read_counts = {"private": 0, "group": 0}
+for kind in ("private", "group"):
+    candidate = next((c for c in chats if bool(c.get("isGroup")) == (kind == "group") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))), None)
+    if candidate:
+        try:
+            result = get("/read?" + urllib.parse.urlencode({"chatId": candidate["id"], "limit": "3"}), timeout=45)
+            read_counts[kind] = len(result.get("messages") or [])
+        except Exception:
+            read_counts[kind] = -1
+status = get("/status")
+final = safe_status(status)
+final.update({
+    "private_read_messages": read_counts["private"],
+    "group_read_messages": read_counts["group"],
+    "bridge_events": status.get("bridgeEventCounts", {}),
+    "private_chat_candidates": sum(1 for c in chats if not c.get("isGroup") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))),
+    "group_chat_candidates": sum(1 for c in chats if c.get("isGroup") and (int(c.get("messageCount") or 0) > 0 or c.get("hasHistoryAnchor"))),
+})
+print("[whatsapp-readonly-final] " + json.dumps(final, sort_keys=True), flush=True)
+# Emit only fixed-format connection and sync counters from the bridge log.
+bridge_log = "/data/platforms/whatsapp/bridge.log"
+patterns = [
+    r"WhatsApp connected!",
+    r"Connection closed \(reason: [0-9]+\)\.",
+    r"WhatsApp history batch: chats=[0-9]+ messages=[0-9]+ sync=[^ ]+ progress=[^ ]+ latest=(true|false) cached_chats=[0-9]+ cached_messages=[0-9]+",
+    r"WhatsApp history status: sync=[^ ]+ status=[^ ]+ explicit=(true|false)",
+    r"WhatsApp chat metadata: [0-9]+ chats",
+]
+try:
+    with open(bridge_log, encoding="utf-8", errors="replace") as handle:
+        for line in handle.readlines()[-120:]:
+            for pattern in patterns:
+                match = re.search(pattern, line)
+                if match:
+                    print("[whatsapp-bridge-log] " + match.group(0), flush=True)
+                    break
+except Exception as exc:
+    print("[whatsapp-bridge-log] unavailable=" + type(exc).__name__, flush=True)
+PY
+  fi
 fi
 
 WEBUI_LOG="${HERMES_HOME}/logs/webui.log"

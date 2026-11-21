@@ -19,6 +19,7 @@ A single password-protected web UI on the Railway public domain ([screenshots](h
 - **Model picker, profile switcher, configurable model badges** in the composer footer
 - **Session search**, slash-command autocomplete, streaming SSE responses, multi-modal uploads
 - **Persistent state** on the `/data` volume — config, sessions, skills, workspace, WebUI state
+- **Viss primary-operator profile** — seeds `SOUL.md` and `memories/USER.md` on a fresh volume only; an existing user identity or memory file is never overwritten
 - **Bundled `searxng-local` skill** so Hermes can query the companion SearXNG service
 - **Official Hermes CLI dashboard** reachable at **`/hermes-dashboard`** on your Railway URL while `hermes dashboard --no-open` runs on loopback inside the container (Hermes SPA expects **`X-Forwarded-Prefix`**; see `admin/dashboard_proxy.py`).
 - **Health check** at `/health` (Railway probe)
@@ -114,9 +115,10 @@ SearXNG can be private-only if Hermes is the only consumer. Keep public HTTP ena
 1. Deploy the two-service template.
 2. Open the Hermes Agent public Railway URL.
 3. Enter the WebUI password (your `ADMIN_PASSWORD` if set; otherwise retrieve it once from `/data/admin.password` or deploy logs — see deploy variables table).
-4. The WebUI's onboarding wizard launches — pick a provider, paste an API key, choose a default model. Configuration is written to `/data/.env` and `/data/config.yaml`.
-5. Send your first message in the chat.
-6. (Optional) To enable Telegram/Discord/Slack/email bridges, configure the channel tokens in **Settings**, then redeploy with `START_GATEWAY=true`.
+4. For ChatGPT subscription access, visit `/tui` and click **Login with ChatGPT (Codex)**. Complete the OpenAI device-code sign-in privately in your browser. This uses ChatGPT OAuth, not `OPENAI_API_KEY` or API billing; usage remains subject to your ChatGPT plan's Codex limits.
+5. For API-key providers, use the WebUI onboarding wizard: pick a provider, paste its API key, choose a default model. Configuration is written to `/data/.env` and `/data/config.yaml`.
+6. Send your first message in the chat.
+7. (Optional) To enable messaging bridges, configure channel credentials in **Settings**, then redeploy with `START_GATEWAY=true`.
 
 ## SearXNG Search
 
@@ -179,7 +181,7 @@ Open `http://localhost:8080` and enter `changeme` at the password prompt.
 
 `/tui` is a two-pane web terminal: a left rail of preset buttons (OAuth login, status commands, file viewers, "Open shell") and a right pane with xterm.js. Behind it are two WebSocket modes:
 
-- **OAuth one-shots** (`/tui/ws/auth/<provider>`) — clicking an OAuth button spawns a dedicated PTY running `hermes auth add <provider> --type oauth --no-browser`. On clean exit, the wrapper writes `model.provider` into `/data/config.yaml`, marks onboarding complete, restarts hermes-webui, and the page redirects you to `/`.
+- **OAuth one-shots** (`/tui/ws/auth/<provider>`) — clicking an OAuth button spawns a dedicated PTY running `hermes auth add <provider> --type oauth --no-browser`. On clean exit, the wrapper selects the provider you explicitly authenticated, updates the provider endpoint and default model, preserves unrelated config such as existing MCP servers, marks onboarding complete, restarts hermes-webui, and the page redirects you to `/`. This ensures a successful ChatGPT Codex login actually switches new sessions away from an older API-key provider.
 - **Shell** (`/tui/ws/shell`) — clicking "Open shell" or any non-OAuth preset spawns `/bin/bash -i` with `cwd=/data` and Hermes' venv on PATH. Run `hermes status`, `hermes auth list`, `cat /data/config.yaml`, `tail .../webui.log` — anything you'd run over SSH.
 
 ### `hermes update` from the Web Terminal
@@ -220,6 +222,8 @@ The wrapper sets **`X-Forwarded-Prefix: /hermes-dashboard`** when forwarding to 
 
 - **Ports:** The public Railway listener stays **`PORT`**. Hermes WebUI listens on **`HERMES_WEBUI_HOST`/`HERMES_WEBUI_PORT`** (default **127.0.0.1:9120**) and is reverse-proxied from **`/`**. The **`hermes dashboard`** subprocess defaults to **`127.0.0.1:9119`** (see **`HERMES_DASHBOARD_*`** defaults in [`entrypoint.sh`](./entrypoint.sh)); traffic is surfaced at **`HERMES_DASHBOARD_MOUNT_PATH`**, not via a separate Railway port.
 - **Skills at boot:** Upstream Docker runs `tools/skills_sync.py` from the Hermes install tree to mirror bundled skills onto the volume. This template does **not** run that script; only bundles under [`hermes-agent-railway/skills/`](./skills/) are copied into `/data/skills` each start. Operators who expect **all** upstream stock skills mirrored should sync them manually or adjust the deployment.
-- Hermes Agent is installed from upstream `NousResearch/hermes-agent` (`ARG HERMES_REF=v2026.6.5`). Override with any valid branch, tag, or SHA.
-- Hermes WebUI is pinned to a specific tag (`ARG HERMES_WEBUI_REF=v0.51.310`). Override to upgrade.
+- Hermes Agent is pinned to upstream release `v0.23.1` (`3b421578588243f920886e6fe79a6faa87ea026e`) with a build-time commit assertion (`HERMES_REF` + `HERMES_COMMIT`).
+- Hermes WebUI is pinned to tag `v0.51.310` (`ARG HERMES_WEBUI_REF`).
+- Hermes' Node and pnpm toolchains are pinned and SHA-256 verified: Node `26.12.1`, pnpm `12.15.0`.
 - `/data` stores config, `.env`, sessions, memories, skills, workspace files, logs, and WebUI state.
+- The Viss operator profile is seeded only when `/data/SOUL.md` or `/data/memories/USER.md` is absent. Redeploys preserve existing user-authored files and evolving Hermes memory.
